@@ -1,0 +1,37 @@
+[project]
+name = "aigis-agent"
+version = "0.1.0"
+description = "GIS intelligent agent skeleton with FastAPI, OSM, OSRM, LangChain and sqlite"
+readme = "README.md"
+authors = [
+    { name = "fyffyf", email = "3517708329@qq.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "fastapi>=0.135.3",
+    "geopandas>=1.1.3",
+    "geopy>=2.4.1",
+    "httpx>=0.28.1",
+    "jinja2>=3.1.6",
+    "langchain>=1.2.15",
+    "langchain-community>=0.4.1",
+    "langchain-openai>=1.1.12",
+    "networkx>=3.4.2",
+    "osmnx>=2.0.7",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+    "pyproj>=3.7.1",
+    "python-dotenv>=1.2.2",
+    "routingpy>=1.3.0",
+    "shapely>=2.1.2",
+    "sqlalchemy>=2.0.49",
+    "uvicorn[standard]>=0.44.0",
+]
+
+[project.scripts]
+aigis-agent = "aigis_agent.main:run"
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"

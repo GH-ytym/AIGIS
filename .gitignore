@@ -1,0 +1,42 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+
+# uv local lockfile
+uv.lock
+
+# Local Python version manager
+.python-version
+
+# Editor/IDE local settings
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+
+# Local runtime data
+data/
+
+# Local environment secrets
+.env
+.env.*
+!.env.example
