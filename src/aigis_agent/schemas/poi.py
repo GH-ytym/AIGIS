@@ -33,13 +33,6 @@ class POISearchDebug(BaseModel):
 
     ai_refine_triggered: bool = False
     ai_refine_applied: bool = False
-    parallel_recall_used: bool = False
-    parallel_local_result_count: int = 0
-    parallel_global_result_count: int = 0
-    parallel_local_score: float = 0.0
-    parallel_best_city: str | None = None
-    parallel_best_city_score: float = 0.0
-    parallel_switch_reason: str | None = None
     city_switch_suggested: bool = False
     city_switch_applied: bool = False
     original_query: str

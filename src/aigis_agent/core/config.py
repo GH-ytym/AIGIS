@@ -56,9 +56,6 @@ class Settings(BaseSettings):
     poi_ai_sparse_result_threshold: int = 2
     poi_ai_result_gain_threshold: float = 0.08
     poi_ai_query_max_length: int = 120
-    poi_parallel_recall_enabled: bool = True
-    poi_parallel_city_switch_margin: float = 0.08
-    poi_parallel_city_switch_min_score: float = 0.62
     poi_ai_strong_landmark_enabled: bool = True
     poi_ai_strong_landmark_suggest_confidence_threshold: float = 0.62
     poi_ai_strong_landmark_confidence_threshold: float = 0.78

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -48,6 +49,31 @@ class POISearchExecution(BaseModel):
 
     items: list[POIItem] = Field(default_factory=list)
     debug: POISearchDebug
+
+
+@dataclass(frozen=True)
+class AdminScope:
+    """Normalized administrative scope split into city and district."""
+
+    city: str | None = None
+    district: str | None = None
+
+    @property
+    def has_value(self) -> bool:
+        """Whether any scope constraint exists."""
+        return bool(self.city or self.district)
+
+    @property
+    def search_hint(self) -> str | None:
+        """Provider hint used in upstream POI API request."""
+        return self.city or self.district
+
+    @property
+    def label(self) -> str | None:
+        """Human-readable scope label used by debug payload."""
+        if self.city and self.district:
+            return f"{self.city}{self.district}"
+        return self.city or self.district
 
 
 class POIQueryRefiner:
@@ -269,8 +295,13 @@ class POISearchService:
     ) -> POISearchExecution:
         """Search POI and return debug details for refinement decisions."""
         raw_query = str(query or "")
-        normalized_query = self._normalize_query(raw_query)
-        normalized_city = self._normalize_city(city_hint)
+        hint_scope = self._parse_admin_scope(city_hint)
+        query_scope = self._extract_scope_from_query(raw_query)
+        scope = query_scope if query_scope.has_value else hint_scope
+        prepared_query = self._prepare_query_text(raw_query, scope)
+        normalized_query = self._normalize_query(prepared_query)
+        normalized_city = scope.label
+        district_locked = self._is_district_locked(raw_query, scope)
         safe_limit = max(1, min(int(limit), 50))
 
         debug = POISearchDebug(
@@ -286,20 +317,22 @@ class POISearchService:
 
         base_items = self._amap_service.search(
             query=normalized_query,
-            city_hint=normalized_city,
+            city_hint=scope.search_hint,
             limit=safe_limit,
         )
 
         base_items, debug, should_return = self._apply_city_scope_guard(
-            city_hint=normalized_city,
+            scope=scope,
             items=base_items,
             debug=debug,
             allow_city_switch=allow_city_switch,
+            district_locked=district_locked,
         )
 
         final_items = list(base_items)
         debug.final_query = normalized_query
-        debug.final_city_hint = normalized_city
+        if not debug.city_switch_applied:
+            debug.final_city_hint = normalized_city
 
         if should_return:
             return POISearchExecution(items=final_items, debug=debug)
@@ -318,6 +351,7 @@ class POISearchService:
                 debug=debug,
                 limit=safe_limit,
                 allow_city_switch=allow_city_switch,
+                district_locked=district_locked,
             )
             return POISearchExecution(items=final_items, debug=debug)
 
@@ -329,6 +363,7 @@ class POISearchService:
             city_hint=normalized_city,
             trigger=retry_trigger,
             base_items=base_items,
+            district_locked=district_locked,
         )
         debug.ai_confidence = ai_confidence
 
@@ -342,14 +377,18 @@ class POISearchService:
                 debug=debug,
                 limit=safe_limit,
                 allow_city_switch=allow_city_switch,
+                district_locked=district_locked,
             )
             return POISearchExecution(items=final_items, debug=debug)
 
         retry_query = candidate.query
         retry_city = candidate.city
         suggested_city = candidate.suggested_city
+        retry_scope = self._parse_admin_scope(retry_city)
+        retry_scope_label = retry_scope.label or retry_city
+        retry_search_hint = retry_scope.search_hint
 
-        if suggested_city and normalized_city and self._city_key(suggested_city) != self._city_key(normalized_city):
+        if suggested_city and normalized_city and self._is_scope_changed(normalized_city, suggested_city):
             debug.city_switch_suggested = True
             debug.city_switch_from = normalized_city
             debug.city_switch_to = suggested_city
@@ -357,12 +396,12 @@ class POISearchService:
         try:
             retry_items = self._amap_service.search(
                 query=retry_query,
-                city_hint=retry_city,
+                city_hint=retry_search_hint,
                 limit=safe_limit,
             )
         except AMapProviderError:
             debug.corrected_query = retry_query
-            debug.corrected_city_hint = suggested_city or retry_city
+            debug.corrected_city_hint = suggested_city or retry_scope_label
             debug.fallback_reason = "ai_retry_provider_failed"
             final_items, debug = self._apply_strong_landmark_guard(
                 query=normalized_query,
@@ -372,30 +411,34 @@ class POISearchService:
                 debug=debug,
                 limit=safe_limit,
                 allow_city_switch=allow_city_switch,
+                district_locked=district_locked,
             )
             return POISearchExecution(items=final_items, debug=debug)
 
+        if retry_scope.has_value:
+            retry_items = self._filter_items_by_scope(retry_items, retry_scope)
+
         debug.corrected_query = retry_query
-        debug.corrected_city_hint = suggested_city or retry_city
+        debug.corrected_city_hint = suggested_city or retry_scope_label
         debug.corrected_items = list(retry_items)
         debug.corrected_result_count = len(retry_items)
 
         city_switched = bool(
             normalized_city
-            and retry_city
-            and self._city_key(retry_city) != self._city_key(normalized_city)
+            and retry_scope_label
+            and self._is_scope_changed(normalized_city, retry_scope_label)
         )
         if city_switched:
             debug.city_switch_suggested = True
             debug.city_switch_from = normalized_city
-            debug.city_switch_to = retry_city
+            debug.city_switch_to = retry_scope_label
 
         can_apply = allow_city_switch or not city_switched
         if can_apply and self._prefer_retry(base_items, retry_items, normalized_query, retry_query):
             final_items = retry_items
             debug.ai_refine_applied = True
             debug.final_query = retry_query
-            debug.final_city_hint = retry_city
+            debug.final_city_hint = retry_scope_label
             if city_switched and allow_city_switch:
                 debug.city_switch_applied = True
         else:
@@ -409,6 +452,7 @@ class POISearchService:
             debug=debug,
             limit=safe_limit,
             allow_city_switch=allow_city_switch,
+            district_locked=district_locked,
         )
 
         return POISearchExecution(items=final_items, debug=debug)
@@ -422,9 +466,15 @@ class POISearchService:
         debug: POISearchDebug,
         limit: int,
         allow_city_switch: bool,
+        district_locked: bool,
     ) -> tuple[list[POIItem], POISearchDebug]:
         """Second defense: AI strong-landmark arbitration for city-switch suggestion."""
         if not city_hint:
+            return current_items, debug
+        if district_locked:
+            return current_items, debug
+        source_scope = self._parse_admin_scope(city_hint)
+        if source_scope.city:
             return current_items, debug
         if not settings.poi_ai_strong_landmark_enabled or not self._query_refiner.enabled:
             return current_items, debug
@@ -463,7 +513,7 @@ class POISearchService:
         suggested_city = self._normalize_city(decision.city_hint_override)
         if not suggested_city:
             return current_items, debug
-        if self._city_key(suggested_city) == self._city_key(city_hint):
+        if not self._is_scope_changed(city_hint, suggested_city):
             return current_items, debug
 
         refined_query = self._normalize_query(decision.cleaned_query) or query
@@ -489,14 +539,18 @@ class POISearchService:
             return current_items, debug
 
         try:
+            switched_scope = self._parse_admin_scope(suggested_city)
             switched_items = self._amap_service.search(
                 query=refined_query,
-                city_hint=suggested_city,
+                city_hint=switched_scope.search_hint,
                 limit=limit,
             )
         except AMapProviderError:
             debug.fallback_reason = "strong_landmark_retry_provider_failed"
             return current_items, debug
+
+        if switched_scope.has_value:
+            switched_items = self._filter_items_by_scope(switched_items, switched_scope)
 
         debug.corrected_items = list(switched_items)
         debug.corrected_result_count = len(switched_items)
@@ -506,7 +560,7 @@ class POISearchService:
             debug.ai_refine_applied = True
             debug.city_switch_applied = True
             debug.final_query = refined_query
-            debug.final_city_hint = suggested_city
+            debug.final_city_hint = switched_scope.label or suggested_city
             return switched_items, debug
 
         if not debug.fallback_reason:
@@ -519,6 +573,7 @@ class POISearchService:
         city_hint: str | None,
         trigger: str,
         base_items: list[POIItem],
+        district_locked: bool,
     ) -> tuple[RefineCandidate | None, float | None, str | None]:
         """Return refined query/city and confidence if candidate is worth retrying."""
         decision = self._query_refiner.refine(
@@ -540,7 +595,11 @@ class POISearchService:
             return None, confidence, "ai_empty_query"
 
         suggested_city = self._normalize_city(decision.city_hint_override)
-        if suggested_city and city_hint and self._city_key(suggested_city) == self._city_key(city_hint):
+        if district_locked:
+            suggested_city = None
+        elif suggested_city and city_hint and self._is_cross_city_switch(city_hint, suggested_city):
+            suggested_city = None
+        elif suggested_city and city_hint and not self._is_scope_changed(city_hint, suggested_city):
             suggested_city = None
 
         refined_city = suggested_city or city_hint
@@ -628,13 +687,21 @@ class POISearchService:
 
     @staticmethod
     def _normalize_city(city_hint: str | None) -> str | None:
-        """Normalize city hint while preserving user-intended city label."""
-        if city_hint is None:
-            return None
+        """Normalize input hint into canonical city/district label."""
+        return POISearchService._parse_admin_scope(city_hint).label
 
-        city = unicodedata.normalize("NFKC", str(city_hint)).strip()
-        city = re.sub(r"\s+", "", city)
-        city = re.sub(r"(\(直辖\)|（直辖）)", "", city)
+    @staticmethod
+    def _normalize_admin_text(text: str | None) -> str:
+        """Shared cleanup for administrative text."""
+        norm = unicodedata.normalize("NFKC", str(text or "")).strip()
+        norm = re.sub(r"\s+", "", norm)
+        norm = re.sub(r"(\(直辖\)|（直辖）)", "", norm)
+        return norm
+
+    @staticmethod
+    def _normalize_city_name(city_hint: str | None) -> str | None:
+        """Normalize city/province-level text to canonical label."""
+        city = POISearchService._normalize_admin_text(city_hint)
         if not city:
             return None
 
@@ -645,66 +712,281 @@ class POISearchService:
         if city in {"北京", "上海", "天津", "重庆"}:
             return f"{city}市"
 
-        if re.search(r"(市|自治州|地区|盟|特别行政区|自治区|省|县|区|旗)$", city):
+        if re.search(r"(市|自治州|地区|盟|特别行政区|自治区|省)$", city):
             return city
 
         return f"{city}市"
 
+    @staticmethod
+    def _normalize_district(district_hint: str | None) -> str | None:
+        """Normalize district/county-level text to canonical label."""
+        district = POISearchService._normalize_admin_text(district_hint)
+        return district or None
+
+    @staticmethod
+    def _parse_admin_scope(city_hint: str | None) -> AdminScope:
+        """Split mixed hint into city and district parts."""
+        text = POISearchService._normalize_admin_text(city_hint)
+        if not text:
+            return AdminScope()
+
+        if re.fullmatch(r"(?:北京|上海|天津|重庆)(?:市)?城区", text):
+            return AdminScope(city=POISearchService._normalize_city_name(text))
+
+        explicit = re.match(
+            r"^(?P<city>.+?(?:市|自治州|地区|盟|特别行政区|自治区|省))(?P<district>.+?(?:自治县|自治旗|特区|林区|区|县|旗))$",
+            text,
+        )
+        if explicit:
+            return AdminScope(
+                city=POISearchService._normalize_city_name(explicit.group("city")),
+                district=POISearchService._normalize_district(explicit.group("district")),
+            )
+
+        loose = re.match(
+            r"^(?P<city>[\u4e00-\u9fff]{2,8}?)(?P<district>[\u4e00-\u9fff]{2,12}(?:自治县|自治旗|特区|林区|区|县|旗))$",
+            text,
+        )
+        if loose:
+            city_part = loose.group("city")
+            district_part = loose.group("district")
+            if len(city_part) >= 2 and len(district_part) >= 2:
+                return AdminScope(
+                    city=POISearchService._normalize_city_name(city_part),
+                    district=POISearchService._normalize_district(district_part),
+                )
+
+        if re.search(r"(自治县|自治旗|特区|林区|区|县|旗)$", text):
+            return AdminScope(district=POISearchService._normalize_district(text))
+
+        return AdminScope(city=POISearchService._normalize_city_name(text))
+
     def _apply_city_scope_guard(
         self,
-        city_hint: str | None,
+        scope: AdminScope,
         items: list[POIItem],
         debug: POISearchDebug,
         allow_city_switch: bool,
+        district_locked: bool,
     ) -> tuple[list[POIItem], POISearchDebug, bool]:
-        """Guard against provider cross-city leakage when city hint is provided."""
-        if not city_hint or not items:
+        """Guard against provider scope leakage with district-first strategy."""
+        if not scope.has_value or not items:
             return items, debug, False
 
-        top_city = self._normalize_city(items[0].city or items[0].province)
-        if not top_city:
+        in_scope_items = self._filter_items_by_scope(items, scope)
+        if in_scope_items:
+            return in_scope_items, debug, False
+
+        if district_locked:
+            if not debug.fallback_reason:
+                debug.fallback_reason = "district_locked_no_result"
+            return [], debug, True
+
+        if scope.city:
+            same_city_items = self._filter_items_by_scope(items, AdminScope(city=scope.city))
+            if same_city_items:
+                best_same_city_scope = self._scope_from_item(same_city_items[0])
+                target_label = best_same_city_scope.label or scope.city
+
+                debug.city_switch_suggested = True
+                debug.city_switch_from = scope.label
+                debug.city_switch_to = target_label
+                if not debug.trigger_reason:
+                    debug.trigger_reason = "top_result_district_mismatch"
+
+                if allow_city_switch and scope.district and best_same_city_scope.district:
+                    debug.city_switch_applied = True
+                    debug.final_city_hint = target_label
+                    return same_city_items, debug, False
+
+                if not debug.fallback_reason:
+                    debug.fallback_reason = "district_scope_no_result"
+                return [], debug, True
+
+            if not debug.fallback_reason:
+                debug.fallback_reason = "city_scope_no_local_result"
+            return [], debug, True
+
+        top_scope = self._scope_from_item(items[0])
+        if not top_scope.has_value:
             return items, debug, False
-        if self._city_key(top_city) == self._city_key(city_hint):
+        if self._scope_matches(scope, top_scope):
             return items, debug, False
 
         debug.city_switch_suggested = True
-        debug.city_switch_from = city_hint
-        debug.city_switch_to = top_city
+        debug.city_switch_from = scope.label
+        debug.city_switch_to = top_scope.label
         if not debug.trigger_reason:
             debug.trigger_reason = "top_result_city_mismatch"
 
         if allow_city_switch:
             return items, debug, False
 
-        local_items = self._filter_items_by_city(items, city_hint)
-        if local_items:
-            if not debug.fallback_reason:
-                debug.fallback_reason = "city_scope_filtered_cross_city_results"
-            return local_items, debug, False
-
         if not debug.fallback_reason:
             debug.fallback_reason = "city_scope_no_local_result"
         return [], debug, True
 
-    def _filter_items_by_city(self, items: list[POIItem], city_hint: str) -> list[POIItem]:
-        """Keep only items that belong to current city key."""
-        target_key = self._city_key(city_hint)
+    @staticmethod
+    def _extract_scope_from_query(query: str) -> AdminScope:
+        """Extract explicit city/district scope from natural-language query."""
+        text = POISearchService._normalize_admin_text(query)
+        if not text:
+            return AdminScope()
+
+        text = re.sub(
+            r"^(?:帮我|麻烦帮我|麻烦|请|请帮我|给我|找一找|找一下|找下|查一下|查下|搜一下|搜下|看下|看看|帮忙|帮我在|在)+",
+            "",
+            text,
+        )
+        if not text:
+            return AdminScope()
+
+        city_district_prefix = re.match(
+            r"^(?P<scope>[\u4e00-\u9fff]{2,14}(?:自治县|自治旗|特区|林区|区|县|旗))",
+            text,
+        )
+        if city_district_prefix:
+            candidate = POISearchService._parse_admin_scope(city_district_prefix.group("scope"))
+            if candidate.has_value:
+                return candidate
+
+        city_prefix = re.match(
+            r"^(?P<scope>[\u4e00-\u9fff]{2,12}(?:市|自治州|地区|盟|特别行政区|自治区|省))",
+            text,
+        )
+        if city_prefix:
+            candidate = POISearchService._parse_admin_scope(city_prefix.group("scope"))
+            if candidate.has_value:
+                return candidate
+
+        return AdminScope()
+
+    @staticmethod
+    def _prepare_query_text(query: str, scope: AdminScope) -> str:
+        """Remove politeness/location wrappers and keep POI keyword core."""
+        text = unicodedata.normalize("NFKC", str(query or "")).strip()
+        if not text:
+            return ""
+
+        text = re.sub(r"\s+", "", text)
+        text = re.sub(
+            r"^(?:帮我|麻烦帮我|麻烦|请|请帮我|给我|找一找|找一下|找下|查一下|查下|搜一下|搜下|看下|看看|帮忙|帮我在|在)+",
+            "",
+            text,
+        )
+
+        if scope.label:
+            text = text.replace(scope.label, "")
+        if scope.city:
+            text = text.replace(scope.city, "")
+            city_alias = re.sub(r"(市|自治州|地区|盟|特别行政区|自治区|省)$", "", scope.city)
+            if city_alias:
+                text = text.replace(city_alias, "")
+        if scope.district:
+            text = text.replace(scope.district, "")
+            district_alias = re.sub(r"(自治县|自治旗|特区|林区|区|县|旗)$", "", scope.district)
+            if district_alias:
+                text = text.replace(district_alias, "")
+
+        text = re.sub(r"^(?:找|查|搜|看|去|到)+", "", text)
+        text = re.sub(r"(?:一下|一哈|一下下|哈|呗|呀|吧|嘛|呢)+$", "", text)
+        return text or query
+
+    @staticmethod
+    def _is_district_locked(query: str, scope: AdminScope) -> bool:
+        """Whether query explicitly anchors target district and should avoid auto-switch."""
+        if not scope.district:
+            return False
+        query_key = POISearchService._text_key(query)
+        district_key = POISearchService._district_key(scope.district)
+        return bool(query_key and district_key and district_key in query_key)
+
+    @staticmethod
+    def _is_cross_city_switch(source_hint: str | None, target_hint: str | None) -> bool:
+        """Whether scope change crosses city boundary."""
+        source = POISearchService._parse_admin_scope(source_hint)
+        target = POISearchService._parse_admin_scope(target_hint)
+        source_city = POISearchService._city_key(source.city or "") if source.city else ""
+        target_city = POISearchService._city_key(target.city or "") if target.city else ""
+        return bool(source_city and target_city and source_city != target_city)
+
+    def _filter_items_by_scope(self, items: list[POIItem], scope: AdminScope) -> list[POIItem]:
+        """Keep only items that belong to current city/district scope."""
         local_items: list[POIItem] = []
         for item in items:
-            item_city = self._normalize_city(item.city or item.province)
-            if not item_city:
-                continue
-            if self._city_key(item_city) == target_key:
+            if self._scope_matches(scope, self._scope_from_item(item)):
                 local_items.append(item)
         return local_items
+
+    def _scope_from_item(self, item: POIItem) -> AdminScope:
+        """Build normalized scope from provider item fields."""
+        return AdminScope(
+            city=self._normalize_city_name(item.city or item.province),
+            district=self._normalize_district(item.district),
+        )
+
+    def _scope_matches(self, expected: AdminScope, actual: AdminScope) -> bool:
+        """Whether provider item scope satisfies expected city/district hint."""
+        if not expected.has_value:
+            return True
+
+        expected_city_key = self._city_key(expected.city or "") if expected.city else ""
+        actual_city_key = self._city_key(actual.city or "") if actual.city else ""
+        if expected_city_key:
+            if not actual_city_key or expected_city_key != actual_city_key:
+                return False
+
+        expected_district_key = self._district_key(expected.district)
+        if expected_district_key:
+            actual_district_key = self._district_key(actual.district)
+            if not actual_district_key or expected_district_key != actual_district_key:
+                return False
+
+        if not expected_city_key and expected_district_key:
+            actual_district_key = self._district_key(actual.district)
+            return bool(actual_district_key and actual_district_key == expected_district_key)
+
+        return bool(expected_city_key or expected_district_key)
+
+    @staticmethod
+    def _is_scope_changed(source_hint: str | None, target_hint: str | None) -> bool:
+        """Check whether two hints point to different city/district scopes."""
+        source = POISearchService._parse_admin_scope(source_hint)
+        target = POISearchService._parse_admin_scope(target_hint)
+
+        source_city = POISearchService._city_key(source.city or "") if source.city else ""
+        target_city = POISearchService._city_key(target.city or "") if target.city else ""
+        if source_city and target_city and source_city != target_city:
+            return True
+
+        source_district = POISearchService._district_key(source.district)
+        target_district = POISearchService._district_key(target.district)
+        if source_district and target_district and source_district != target_district:
+            return True
+
+        if not source_city and not target_city and source_district and target_district:
+            return source_district != target_district
+
+        return False
 
     @staticmethod
     def _city_key(city: str) -> str:
         """Canonical city key for conflict comparison."""
-        norm = unicodedata.normalize("NFKC", city).strip()
+        scope = POISearchService._parse_admin_scope(city)
+        base = scope.city or city
+        norm = unicodedata.normalize("NFKC", base).strip()
         norm = re.sub(r"\s+", "", norm)
         norm = re.sub(r"(?:市)?城区$", "", norm)
-        return re.sub(r"(省|市|自治区|特别行政区|地区|盟|州)$", "", norm)
+        return re.sub(r"(省|市|自治区|特别行政区|地区|盟|自治州)$", "", norm)
+
+    @staticmethod
+    def _district_key(district: str | None) -> str:
+        """Canonical district key for district-level scope matching."""
+        norm = POISearchService._normalize_district(district) or ""
+        if not norm:
+            return ""
+        norm = re.sub(r"\s+", "", norm)
+        return re.sub(r"(自治县|自治旗|特区|林区|区|县|旗)$", "", norm)
 
     @staticmethod
     def _is_alpha_only(query: str) -> bool:

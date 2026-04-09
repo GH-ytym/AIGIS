@@ -101,15 +101,26 @@ function askCitySwitchConfirm(targetCity) {
     return Promise.resolve(false);
   }
 
+  const targetScope = splitCityDistrictHint(safeTargetCity);
+  const currentScope = splitCityDistrictHint(getCurrentCityHintForSearch());
+  const sameCity =
+    normalizeDistrictName(targetScope.city || "") &&
+    normalizeDistrictName(currentScope.city || "") &&
+    normalizeDistrictName(targetScope.city || "") === normalizeDistrictName(currentScope.city || "");
+  const promptText =
+    sameCity && targetScope.district
+      ? `是否要切换区县到${targetScope.district}？`
+      : `是否要切换区域到${safeTargetCity}？`;
+
   if (!citySwitchPrompt || !citySwitchPromptText || !citySwitchYesBtn || !citySwitchNoBtn) {
-    return Promise.resolve(window.confirm(`是否要切换城市到${safeTargetCity}？`));
+    return Promise.resolve(window.confirm(promptText));
   }
 
   if (citySwitchPromptResolver) {
     resolveCitySwitchPrompt(false);
   }
 
-  citySwitchPromptText.textContent = `是否要切换城市到${safeTargetCity}？`;
+  citySwitchPromptText.textContent = promptText;
   setCitySwitchPromptOpen(true);
 
   return new Promise((resolve) => {
@@ -141,6 +152,21 @@ function getCitySwitchSuggestion(debugPayload, fallbackFromCity) {
   const fromCity = String(
     debugPayload.city_switch_from || debugPayload.original_city_hint || fallbackFromCity || ""
   ).trim();
+
+  const fromScope = splitCityDistrictHint(fromCity);
+  const targetScope = splitCityDistrictHint(targetCity);
+  const fromCityKey = normalizeDistrictName(fromScope.city || "");
+  const toCityKey = normalizeDistrictName(targetScope.city || "");
+  if (fromCityKey && toCityKey && fromCityKey !== toCityKey) {
+    return null;
+  }
+
+  const fromDistrictKey = normalizeDistrictName(fromScope.district || "");
+  const toDistrictKey = normalizeDistrictName(targetScope.district || "");
+  if (fromDistrictKey && toDistrictKey && fromDistrictKey === toDistrictKey) {
+    return null;
+  }
+
   const fromKey = normalizeDistrictName(fromCity);
   const toKey = normalizeDistrictName(targetCity);
   if (fromKey && toKey && fromKey === toKey) {
@@ -158,13 +184,41 @@ function getCitySwitchSuggestionFromResults(items, currentCityHint) {
     return null;
   }
 
-  const top = items[0] && typeof items[0] === "object" ? items[0] : null;
-  if (!top) {
+  const fromCity = canonicalizeCityHint(currentCityHint || "");
+  const fromScope = splitCityDistrictHint(fromCity);
+
+  let candidate = items[0] && typeof items[0] === "object" ? items[0] : null;
+  if (fromScope.city) {
+    const fromCityKey = normalizeDistrictName(fromScope.city);
+    const sameCityCandidates = items.filter((item) => {
+      if (!item || typeof item !== "object") {
+        return false;
+      }
+      const itemCity = canonicalizeCityHint(item.city || item.province || "");
+      return normalizeDistrictName(itemCity) === fromCityKey;
+    });
+
+    if (!sameCityCandidates.length) {
+      return null;
+    }
+
+    if (fromScope.district) {
+      const fromDistrictKey = normalizeDistrictName(fromScope.district);
+      const diffDistrict = sameCityCandidates.find((item) => {
+        const itemDistrict = canonicalizeCityHint(item.district || "");
+        return normalizeDistrictName(itemDistrict) && normalizeDistrictName(itemDistrict) !== fromDistrictKey;
+      });
+      candidate = diffDistrict || sameCityCandidates[0];
+    } else {
+      candidate = sameCityCandidates[0];
+    }
+  }
+
+  if (!candidate) {
     return null;
   }
 
-  const fromCity = canonicalizeCityHint(currentCityHint || "");
-  const targetCity = canonicalizeCityHint(top.city || top.province || "");
+  const targetCity = composeCityHint(candidate.city || candidate.province || "", candidate.district || "");
   if (!fromCity || !targetCity) {
     return null;
   }
@@ -322,13 +376,6 @@ function renderPoiDebug(debugPayload) {
   const view = {
     ai_refine_triggered: Boolean(debugPayload.ai_refine_triggered),
     ai_refine_applied: Boolean(debugPayload.ai_refine_applied),
-    parallel_recall_used: Boolean(debugPayload.parallel_recall_used),
-    parallel_local_result_count: Number(debugPayload.parallel_local_result_count || 0),
-    parallel_global_result_count: Number(debugPayload.parallel_global_result_count || 0),
-    parallel_local_score: Number(debugPayload.parallel_local_score || 0),
-    parallel_best_city: debugPayload.parallel_best_city || null,
-    parallel_best_city_score: Number(debugPayload.parallel_best_city_score || 0),
-    parallel_switch_reason: debugPayload.parallel_switch_reason || null,
     city_switch_suggested: Boolean(debugPayload.city_switch_suggested),
     city_switch_applied: Boolean(debugPayload.city_switch_applied),
     city_switch_from: debugPayload.city_switch_from || null,
@@ -717,6 +764,101 @@ function canonicalizeCityHint(name) {
   return `${raw}市`;
 }
 
+function splitCityDistrictHint(name) {
+  const raw = canonicalizeCityHint(name);
+  if (!raw) {
+    return {
+      city: "",
+      district: "",
+    };
+  }
+
+  const explicit = raw.match(
+    /^(.+?(?:市|自治州|地区|盟|特别行政区|自治区|省))(.+?(?:自治县|自治旗|特区|林区|区|县|旗))$/u
+  );
+  if (explicit) {
+    return {
+      city: canonicalizeCityHint(explicit[1]),
+      district: canonicalizeCityHint(explicit[2]),
+    };
+  }
+
+  const loose = raw.match(/^([\u4e00-\u9fff]{2,8}?)([\u4e00-\u9fff]{2,12}(?:自治县|自治旗|特区|林区|区|县|旗))$/u);
+  if (loose && loose[1] && loose[2]) {
+    return {
+      city: canonicalizeCityHint(loose[1]),
+      district: canonicalizeCityHint(loose[2]),
+    };
+  }
+
+  if (/(自治县|自治旗|特区|林区|区|县|旗)$/u.test(raw)) {
+    return {
+      city: "",
+      district: raw,
+    };
+  }
+
+  return {
+    city: raw,
+    district: "",
+  };
+}
+
+function composeCityHint(cityName, districtName = "") {
+  const city = canonicalizeCityHint(cityName);
+  const district = canonicalizeCityHint(districtName);
+
+  if (city && district) {
+    const cityAlias = normalizeDistrictName(city);
+    const districtAlias = normalizeDistrictName(district);
+    if (districtAlias && cityAlias && districtAlias.startsWith(cityAlias)) {
+      return district;
+    }
+    return `${city}${district}`;
+  }
+
+  return district || city;
+}
+
+function extractScopeHintFromQuery(query) {
+  const raw = String(query || "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/[，。！？、；：,.!?;:]/gu, "");
+
+  if (!raw) {
+    return "";
+  }
+
+  const stripped = raw.replace(
+    /^(?:帮我|麻烦帮我|麻烦|请|请帮我|给我|找一找|找一下|找下|查一下|查下|搜一下|搜下|看下|看看|帮忙|帮我在|在)+/u,
+    ""
+  );
+  if (!stripped) {
+    return "";
+  }
+
+  const districtPrefix = stripped.match(/^([\u4e00-\u9fff]{2,14}(?:自治县|自治旗|特区|林区|区|县|旗))/u);
+  if (districtPrefix && districtPrefix[1]) {
+    const scope = splitCityDistrictHint(districtPrefix[1]);
+    const composed = composeCityHint(scope.city, scope.district);
+    if (composed) {
+      return composed;
+    }
+  }
+
+  const cityPrefix = stripped.match(/^([\u4e00-\u9fff]{2,12}(?:市|自治州|地区|盟|特别行政区|自治区|省))/u);
+  if (cityPrefix && cityPrefix[1]) {
+    const scope = splitCityDistrictHint(cityPrefix[1]);
+    const composed = composeCityHint(scope.city, scope.district);
+    if (composed) {
+      return composed;
+    }
+  }
+
+  return "";
+}
+
 function findItemIndexByName(items, preferredName) {
   if (!preferredName || !items.length) {
     return -1;
@@ -734,14 +876,14 @@ function findItemIndexByName(items, preferredName) {
 }
 
 function getCurrentCityItem() {
-  const selectedCity = getSelectedItem(citySelect, cityItems);
-  if (selectedCity) {
-    return selectedCity;
-  }
-
   const selectedDistrict = getSelectedItem(districtSelect, districtItems);
   if (selectedDistrict) {
     return selectedDistrict;
+  }
+
+  const selectedCity = getSelectedItem(citySelect, cityItems);
+  if (selectedCity) {
+    return selectedCity;
   }
 
   return getSelectedItem(provinceSelect, provinceItems);
@@ -749,6 +891,11 @@ function getCurrentCityItem() {
 
 function getCurrentCityHintForSearch() {
   const selectedCity = getSelectedItem(citySelect, cityItems);
+  const selectedDistrict = getSelectedItem(districtSelect, districtItems);
+  if (selectedDistrict && selectedDistrict.name) {
+    return composeCityHint(selectedCity && selectedCity.name ? selectedCity.name : "", selectedDistrict.name);
+  }
+
   if (selectedCity && selectedCity.name) {
     return canonicalizeCityHint(selectedCity.name);
   }
@@ -762,6 +909,11 @@ function getCurrentCityHintForSearch() {
 }
 
 function inferCityHintForQuery(query) {
+  const explicitScopeHint = extractScopeHintFromQuery(query);
+  if (explicitScopeHint) {
+    return explicitScopeHint;
+  }
+
   const currentCity = getCurrentCityItem();
   if (!currentCity || !currentCity.name) {
     return null;
@@ -796,7 +948,8 @@ function inferCityHintForQuery(query) {
     return null;
   }
 
-  return canonicalizeCityHint(cityName);
+  const scopedHint = getCurrentCityHintForSearch();
+  return scopedHint || canonicalizeCityHint(cityName);
 }
 
 function focusToDistrict(item) {
@@ -996,9 +1149,10 @@ async function syncCityPickerByTopResult(topItem = null, fallbackCityName = "") 
   }
 
   const safeTopItem = topItem && typeof topItem === "object" ? topItem : {};
+  const fallbackScope = splitCityDistrictHint(fallbackCityName);
   const targetProvince = String(safeTopItem.province || "").trim();
-  const targetCity = canonicalizeCityHint(safeTopItem.city || fallbackCityName || "");
-  const targetDistrict = String(safeTopItem.district || "").trim();
+  const targetCity = canonicalizeCityHint(safeTopItem.city || fallbackScope.city || fallbackCityName || "");
+  const targetDistrict = String(safeTopItem.district || fallbackScope.district || "").trim();
 
   if (!targetCity) {
     return;
@@ -1160,7 +1314,11 @@ async function searchPoi() {
           limit: SEARCH_RESULT_LIMIT,
           allow_city_switch: true,
         };
-        const switchedCityHint = canonicalizeCityHint(switchSuggestion.targetCity);
+        const switchedScope = splitCityDistrictHint(switchSuggestion.targetCity);
+        const switchedCityHint = composeCityHint(
+          switchedScope.city || switchSuggestion.targetCity,
+          switchedScope.district
+        );
         if (switchedCityHint) {
           switchedPayload.city_hint = switchedCityHint;
         } else if (cityHint) {
