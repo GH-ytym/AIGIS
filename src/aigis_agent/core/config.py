@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     openai_base_url: str | None = None
     llm_temperature: float = 0.0
     llm_timeout_s: float = 30.0
+    agent_query_max_length: int = 300
 
     poi_ai_refine_enabled: bool = True
     poi_ai_confidence_threshold: float = 0.72
@@ -53,11 +54,16 @@ class Settings(BaseSettings):
     poi_ai_retry_zero_result: bool = True
     poi_ai_alpha_result_threshold: int = 3
     poi_ai_sparse_result_threshold: int = 2
+    poi_ai_result_gain_threshold: float = 0.08
+    poi_ai_query_max_length: int = 120
     poi_parallel_recall_enabled: bool = True
     poi_parallel_city_switch_margin: float = 0.08
     poi_parallel_city_switch_min_score: float = 0.62
     poi_ai_strong_landmark_enabled: bool = True
+    poi_ai_strong_landmark_suggest_confidence_threshold: float = 0.62
     poi_ai_strong_landmark_confidence_threshold: float = 0.78
+    poi_ai_strong_landmark_min_query_len: int = 2
+    poi_ai_strong_landmark_max_query_len: int = 12
 
     sqlite_url: str = f"sqlite:///{WORKSPACE_DIR / 'data' / 'aigis.db'}"
 

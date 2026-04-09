@@ -54,6 +54,8 @@ class POISearchDebug(BaseModel):
     corrected_city_hint: str | None = None
     corrected_result_count: int = 0
     corrected_items: list[POIItem] = Field(default_factory=list)
+    ai_confidence: float | None = None
+    fallback_reason: str | None = None
 
 
 class POISearchResponse(BaseModel):

@@ -29,6 +29,10 @@ const DEFAULT_PROVINCE_NAME = "湖北省";
 const DEFAULT_CITY_NAME = "武汉市";
 const DEFAULT_DISTRICT_NAME = "洪山区";
 let markers = [];
+let markerByResultIndex = [];
+let resultCards = [];
+let currentResultItems = [];
+let activeResultIndex = -1;
 let isResultCollapsed = false;
 let cityFocusMarker = null;
 let provinceItems = [];
@@ -149,6 +153,34 @@ function getCitySwitchSuggestion(debugPayload, fallbackFromCity) {
   };
 }
 
+function getCitySwitchSuggestionFromResults(items, currentCityHint) {
+  if (!Array.isArray(items) || !items.length) {
+    return null;
+  }
+
+  const top = items[0] && typeof items[0] === "object" ? items[0] : null;
+  if (!top) {
+    return null;
+  }
+
+  const fromCity = canonicalizeCityHint(currentCityHint || "");
+  const targetCity = canonicalizeCityHint(top.city || top.province || "");
+  if (!fromCity || !targetCity) {
+    return null;
+  }
+
+  const fromKey = normalizeDistrictName(fromCity);
+  const toKey = normalizeDistrictName(targetCity);
+  if (!fromKey || !toKey || fromKey === toKey) {
+    return null;
+  }
+
+  return {
+    fromCity,
+    targetCity,
+  };
+}
+
 function renderAgentBubble(content, isError = false) {
   if (!agentChatBubble) {
     return;
@@ -189,9 +221,57 @@ function appendAgentBubbleLine(line, isError = false) {
 function clearMarkers() {
   markers.forEach((m) => map.removeLayer(m));
   markers = [];
+  markerByResultIndex = [];
+}
+
+function setActiveResultIndex(index) {
+  activeResultIndex = Number.isInteger(index) ? index : -1;
+
+  resultCards.forEach((card, idx) => {
+    card.classList.toggle("active", idx === activeResultIndex);
+  });
+
+  markerByResultIndex.forEach((marker, idx) => {
+    if (!marker) {
+      return;
+    }
+    marker.setZIndexOffset(idx === activeResultIndex ? 1200 : 0);
+  });
+}
+
+function focusResultByIndex(index, options = {}) {
+  if (!Number.isInteger(index) || index < 0 || index >= currentResultItems.length) {
+    return;
+  }
+
+  const item = currentResultItems[index] || {};
+  const marker = markerByResultIndex[index] || null;
+  setActiveResultIndex(index);
+
+  if (marker) {
+    marker.openPopup();
+  }
+
+  const canMoveMap =
+    options.moveMap !== false && typeof item.lat === "number" && typeof item.lon === "number";
+  if (canMoveMap) {
+    const nextZoom = Math.max(map.getZoom(), 15);
+    map.flyTo([item.lat, item.lon], nextZoom, { duration: 0.45 });
+  }
+
+  if (options.scrollCard !== false) {
+    const card = resultCards[index];
+    if (card) {
+      card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }
 }
 
 function renderStatusCard(text, isError = false) {
+  currentResultItems = [];
+  resultCards = [];
+  setActiveResultIndex(-1);
+
   const status = document.createElement("div");
   status.className = `result-card status-card${isError ? " error" : ""}`;
   status.textContent = text;
@@ -270,17 +350,24 @@ function renderPoiDebug(debugPayload) {
 }
 
 function renderPoiResults(items, query) {
+  currentResultItems = Array.isArray(items) ? items : [];
+  resultCards = [];
+  setActiveResultIndex(-1);
+
   poiResults.innerHTML = "";
 
-  if (!items.length) {
+  if (!currentResultItems.length) {
     renderStatusCard(`未找到“${query}”相关结果，可尝试增加城市前缀。`);
     return;
   }
 
   const fragment = document.createDocumentFragment();
-  items.forEach((item) => {
+  currentResultItems.forEach((item, index) => {
     const card = document.createElement("article");
     card.className = "result-card";
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-label", `定位到第${index + 1}个结果：${item.name || query}`);
 
     const title = document.createElement("h3");
     title.className = "result-title";
@@ -292,6 +379,19 @@ function renderPoiResults(items, query) {
 
     card.appendChild(title);
     card.appendChild(address);
+
+    card.addEventListener("click", () => {
+      focusResultByIndex(index);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      event.preventDefault();
+      focusResultByIndex(index);
+    });
+
+    resultCards.push(card);
     fragment.appendChild(card);
   });
 
@@ -300,12 +400,13 @@ function renderPoiResults(items, query) {
 
 function plotMarkers(items) {
   clearMarkers();
+  markerByResultIndex = new Array(items.length).fill(null);
   if (!items.length) {
     return;
   }
 
   const points = [];
-  items.forEach((item) => {
+  items.forEach((item, index) => {
     if (typeof item.lat !== "number" || typeof item.lon !== "number") {
       return;
     }
@@ -314,6 +415,12 @@ function plotMarkers(items) {
       .addTo(map)
       .bindPopup(item.address || item.name || "未命名地点");
     markers.push(marker);
+    markerByResultIndex[index] = marker;
+
+    marker.on("click", () => {
+      focusResultByIndex(index, { moveMap: false, scrollCard: true });
+    });
+
     points.push([item.lat, item.lon]);
   });
 
@@ -589,6 +696,27 @@ function normalizeDistrictName(name) {
     .replace(/(省|市|区|县|自治区|自治州|地区|盟|特别行政区)$/u, "");
 }
 
+function canonicalizeCityHint(name) {
+  const raw = String(name || "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/(\(直辖\)|（直辖）)/gu, "");
+
+  if (!raw) {
+    return "";
+  }
+
+  if (/^(北京|上海|天津|重庆)$/u.test(raw)) {
+    return `${raw}市`;
+  }
+
+  if (/(市|自治州|地区|盟|特别行政区|自治区|省|县|区|旗)$/u.test(raw)) {
+    return raw;
+  }
+
+  return `${raw}市`;
+}
+
 function findItemIndexByName(items, preferredName) {
   if (!preferredName || !items.length) {
     return -1;
@@ -617,6 +745,20 @@ function getCurrentCityItem() {
   }
 
   return getSelectedItem(provinceSelect, provinceItems);
+}
+
+function getCurrentCityHintForSearch() {
+  const selectedCity = getSelectedItem(citySelect, cityItems);
+  if (selectedCity && selectedCity.name) {
+    return canonicalizeCityHint(selectedCity.name);
+  }
+
+  const selectedProvince = getSelectedItem(provinceSelect, provinceItems);
+  if (selectedProvince && selectedProvince.name) {
+    return canonicalizeCityHint(selectedProvince.name);
+  }
+
+  return "";
 }
 
 function inferCityHintForQuery(query) {
@@ -654,7 +796,7 @@ function inferCityHintForQuery(query) {
     return null;
   }
 
-  return cityName;
+  return canonicalizeCityHint(cityName);
 }
 
 function focusToDistrict(item) {
@@ -844,8 +986,8 @@ function applyCitySelection() {
   setCityPickerTip("请先选择区域。", true);
 }
 
-async function syncCityPickerByTopResult(topItem, fallbackCityName = "") {
-  if (!topItem || !provinceSelect || !citySelect || !districtSelect) {
+async function syncCityPickerByTopResult(topItem = null, fallbackCityName = "") {
+  if (!provinceSelect || !citySelect || !districtSelect) {
     return;
   }
 
@@ -853,9 +995,10 @@ async function syncCityPickerByTopResult(topItem, fallbackCityName = "") {
     await loadProvinces();
   }
 
-  const targetProvince = String(topItem.province || "").trim();
-  const targetCity = String(topItem.city || fallbackCityName || "").trim();
-  const targetDistrict = String(topItem.district || "").trim();
+  const safeTopItem = topItem && typeof topItem === "object" ? topItem : {};
+  const targetProvince = String(safeTopItem.province || "").trim();
+  const targetCity = canonicalizeCityHint(safeTopItem.city || fallbackCityName || "");
+  const targetDistrict = String(safeTopItem.district || "").trim();
 
   if (!targetCity) {
     return;
@@ -869,6 +1012,16 @@ async function syncCityPickerByTopResult(topItem, fallbackCityName = "") {
   if (provinceIndex >= 0) {
     provinceSelect.selectedIndex = provinceIndex + 1;
     await onProvinceChange(targetCity, targetDistrict);
+  } else {
+    for (let idx = 0; idx < provinceItems.length; idx += 1) {
+      provinceSelect.selectedIndex = idx + 1;
+      await onProvinceChange(targetCity, targetDistrict);
+      const cityIndex = findItemIndexByName(cityItems, targetCity);
+      if (cityIndex >= 0) {
+        provinceIndex = idx;
+        break;
+      }
+    }
   }
 
   if (!citySelect.disabled) {
@@ -948,7 +1101,9 @@ async function searchPoi() {
   renderPoiDebug({ status: "搜索中..." });
 
   try {
-    const cityHint = inferCityHintForQuery(query);
+    const inferredCityHint = inferCityHintForQuery(query);
+    const currentCityHint = getCurrentCityHintForSearch();
+    const cityHint = inferredCityHint || currentCityHint;
     const basePayload = {
       query,
       limit: SEARCH_RESULT_LIMIT,
@@ -987,16 +1142,28 @@ async function searchPoi() {
       data && typeof data.debug === "object" && data.debug !== null
         ? data.debug
         : {};
-    const switchSuggestion = getCitySwitchSuggestion(debugForSwitch, cityHint);
+    const currentCityForSwitch = cityHint || getCurrentCityHintForSearch();
+    let switchSuggestion = getCitySwitchSuggestion(debugForSwitch, currentCityForSwitch);
+    if (!switchSuggestion) {
+      switchSuggestion = getCitySwitchSuggestionFromResults(
+        Array.isArray(data.items) ? data.items : [],
+        currentCityForSwitch
+      );
+    }
     if (switchSuggestion) {
       const confirmed = await askCitySwitchConfirm(switchSuggestion.targetCity);
       if (confirmed) {
+        await syncCityPickerByTopResult(null, switchSuggestion.targetCity);
+
         const switchedPayload = {
           query,
           limit: SEARCH_RESULT_LIMIT,
           allow_city_switch: true,
         };
-        if (cityHint) {
+        const switchedCityHint = canonicalizeCityHint(switchSuggestion.targetCity);
+        if (switchedCityHint) {
+          switchedPayload.city_hint = switchedCityHint;
+        } else if (cityHint) {
           switchedPayload.city_hint = cityHint;
         }
         assistData = await runAssistStream(switchedPayload);

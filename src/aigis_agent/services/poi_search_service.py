@@ -1,9 +1,7 @@
-"""POI search orchestration with optional AI query refinement."""
+"""POI search orchestration with AI-enhanced fuzzy retrieval."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 import unicodedata
@@ -15,33 +13,30 @@ from pydantic import BaseModel, Field
 
 from aigis_agent.core.config import settings
 from aigis_agent.schemas.poi import POIItem, POISearchDebug
-from aigis_agent.services.amap_service import AMapService
-
-MUNICIPALITY_BASES: set[str] = {"北京", "上海", "天津", "重庆"}
-
-TYPO_RISK_TOKENS: tuple[str, ...] = (
-    "咖非",
-    "星巴客",
-    "医阮",
-    "地铁占",
-    "附进",
-    "俯近",
-)
+from aigis_agent.services.amap_service import AMapProviderError, AMapService
 
 
 class QueryRefineDecision(BaseModel):
-    """Structured output for query refinement."""
+    """Structured output for AI query refinement."""
 
     cleaned_query: str
     city_hint_override: str | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+
+
+class StrongLandmarkDecision(BaseModel):
+    """Structured output for strong landmark arbitration."""
+
     is_strong_landmark: bool = False
-    force_city_switch: bool = False
+    city_hint_override: str | None = None
+    cleaned_query: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason: str = ""
 
 
 class RefineCandidate(BaseModel):
-    """Execution-ready retry candidate and optional city-switch suggestion."""
+    """Execution-ready retry candidate with optional city suggestion."""
 
     query: str
     city: str | None = None
@@ -56,7 +51,7 @@ class POISearchExecution(BaseModel):
 
 
 class POIQueryRefiner:
-    """Use LLM to refine typo/pinyin/city-conflict query inputs."""
+    """Use LLM to refine typo/pinyin/noisy query input for POI search."""
 
     def __init__(self) -> None:
         self._llm: ChatOpenAI | None = None
@@ -89,15 +84,12 @@ class POIQueryRefiner:
             return None
 
         system_prompt = (
-            "You are a GIS keyword normalizer for AMap search. "
-            "Only handle these cases: typo correction, pinyin-to-Chinese conversion, "
-            "and city hint correction when current-city results are sparse. "
-            "When trigger indicates name mismatch in current city, "
-            "you may infer and return the most likely city-level hint for well-known landmarks/scenic spots. "
-            "Do not return detailed addresses, only city-level hint in city_hint_override. "
-            "Do not invent specific addresses. "
+            "You are a Chinese GIS query refiner for POI fuzzy search. "
+            "Only do: typo correction, pinyin-to-Chinese normalization, and optional city-level hint inference. "
+            "Do not fabricate detailed addresses and do not output district/street suggestions. "
+            "Infer only city-level hint when current retrieval looks off-topic or sparse. "
             "Return JSON only with keys: cleaned_query, city_hint_override, confidence, reason. "
-            "If no change is needed, keep cleaned_query same as input and city_hint_override as null."
+            "If no refinement is needed, keep cleaned_query equal to input and city_hint_override as null."
         )
         payload = {
             "query": query,
@@ -135,6 +127,7 @@ class POIQueryRefiner:
                 cleaned_city = str(decision.city_hint_override).strip()
                 decision.city_hint_override = cleaned_city or None
 
+            decision.reason = str(decision.reason or "").strip()
             return decision
         except Exception:
             return None
@@ -144,22 +137,19 @@ class POIQueryRefiner:
         query: str,
         city_hint: str,
         local_items: list[POIItem],
-        candidate_city: str,
-        candidate_score: float,
-        candidate_items: list[POIItem],
-    ) -> QueryRefineDecision | None:
-        """Decide whether query is a strong landmark that should force city switch."""
+    ) -> StrongLandmarkDecision | None:
+        """Judge whether query is strong landmark and suggest city-level override."""
         if self._llm is None:
             return None
 
         system_prompt = (
-            "You are a GIS landmark disambiguation engine. "
-            "Determine whether the query is a strong landmark that should force city switch. "
-            "Strong landmark means iconic and city-anchored POI (example: 东方明珠 -> 上海). "
-            "If yes, set is_strong_landmark=true, force_city_switch=true, and return city_hint_override. "
-            "Use only city-level hint, never detailed addresses. "
-            "Return JSON only with keys: cleaned_query, city_hint_override, confidence, "
-            "is_strong_landmark, force_city_switch, reason."
+            "You are a GIS landmark disambiguation judge. "
+            "Decide whether query is a strong landmark that is city-anchored. "
+            "Prefer recall over precision for city-switch suggestion: when query likely refers to a famous landmark, return is_strong_landmark=true. "
+            "Even if current-city hits contain compound names (for example residential phase/parking/commercial aliases), you may still suggest switch. "
+            "If yes, provide city-level hint only in city_hint_override. "
+            "Never output full street address. "
+            "Return JSON only with keys: is_strong_landmark, city_hint_override, cleaned_query, confidence, reason."
         )
         payload = {
             "query": query,
@@ -172,17 +162,6 @@ class POIQueryRefiner:
                     "district": item.district,
                 }
                 for item in local_items[:5]
-            ],
-            "candidate_city": candidate_city,
-            "candidate_city_score": candidate_score,
-            "candidate_city_top_results": [
-                {
-                    "name": item.name,
-                    "address": item.address,
-                    "city": item.city,
-                    "district": item.district,
-                }
-                for item in candidate_items[:5]
             ],
         }
 
@@ -198,16 +177,13 @@ class POIQueryRefiner:
             if data is None:
                 return None
 
-            decision = QueryRefineDecision.model_validate(data)
-            cleaned_query = str(decision.cleaned_query or "").strip()
-            decision.cleaned_query = cleaned_query or query
-
+            decision = StrongLandmarkDecision.model_validate(data)
+            decision.cleaned_query = str(decision.cleaned_query or "").strip() or query
             if decision.city_hint_override is not None:
                 cleaned_city = str(decision.city_hint_override).strip()
                 decision.city_hint_override = cleaned_city or None
-
+            decision.reason = str(decision.reason or "").strip()
             decision.is_strong_landmark = bool(decision.is_strong_landmark)
-            decision.force_city_switch = bool(decision.force_city_switch)
             return decision
         except Exception:
             return None
@@ -233,7 +209,7 @@ class POIQueryRefiner:
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any] | None:
         """Parse JSON object from raw model output text."""
-        stripped = text.strip()
+        stripped = str(text or "").strip()
         if not stripped:
             return None
 
@@ -293,8 +269,10 @@ class POISearchService:
     ) -> POISearchExecution:
         """Search POI and return debug details for refinement decisions."""
         raw_query = str(query or "")
-        normalized_query = self._normalize_query(query)
+        normalized_query = self._normalize_query(raw_query)
         normalized_city = self._normalize_city(city_hint)
+        safe_limit = max(1, min(int(limit), 50))
+
         debug = POISearchDebug(
             original_query=raw_query,
             normalized_query=normalized_query,
@@ -306,199 +284,234 @@ class POISearchService:
         if not normalized_query:
             return POISearchExecution(items=[], debug=debug)
 
-        active_query = normalized_query
-        active_city = normalized_city
+        base_items = self._amap_service.search(
+            query=normalized_query,
+            city_hint=normalized_city,
+            limit=safe_limit,
+        )
 
-        if normalized_city and settings.poi_parallel_recall_enabled:
-            local_items, global_items = self._search_parallel_local_global(
-                query=active_query,
-                city_hint=active_city,
-                limit=limit,
-            )
-            base_items = local_items
-            final_items = local_items
+        base_items, debug, should_return = self._apply_city_scope_guard(
+            city_hint=normalized_city,
+            items=base_items,
+            debug=debug,
+            allow_city_switch=allow_city_switch,
+        )
 
-            local_score = self._city_relevance_score(active_query, local_items)
-            best_city, best_city_items, best_city_score = self._select_best_global_city(
-                query=active_query,
-                local_city=active_city,
-                global_items=global_items,
-            )
+        final_items = list(base_items)
+        debug.final_query = normalized_query
+        debug.final_city_hint = normalized_city
 
-            debug.parallel_recall_used = True
-            debug.parallel_local_result_count = len(local_items)
-            debug.parallel_global_result_count = len(global_items)
-            debug.parallel_local_score = round(local_score, 4)
-            debug.parallel_best_city = best_city
-            debug.parallel_best_city_score = round(best_city_score, 4)
-
-            switch_reason = self._switch_reason_by_relevance(
-                query=active_query,
-                local_city=active_city,
-                local_items=local_items,
-                local_score=local_score,
-                candidate_city=best_city,
-                candidate_items=best_city_items,
-                candidate_score=best_city_score,
-            )
-            if switch_reason:
-                debug.parallel_switch_reason = switch_reason
-                debug.city_switch_suggested = True
-                debug.city_switch_from = active_city
-                debug.city_switch_to = best_city
-                debug.trigger_reason = f"parallel_recall_compare:{switch_reason}"
-                debug.corrected_query = active_query
-                debug.corrected_city_hint = best_city
-                debug.corrected_items = list(best_city_items)
-                debug.corrected_result_count = len(best_city_items)
-
-                if allow_city_switch:
-                    final_items = best_city_items
-                    debug.city_switch_applied = True
-                    debug.final_query = active_query
-                    debug.final_city_hint = best_city
-                    return POISearchExecution(items=final_items, debug=debug)
-
-                debug.final_query = active_query
-                debug.final_city_hint = active_city
-                return POISearchExecution(items=final_items, debug=debug)
-
-            strong_landmark_candidate: RefineCandidate | None = None
-            if self._should_run_strong_landmark_check(
-                query=active_query,
-                local_items=local_items,
-                best_city=best_city,
-                local_score=local_score,
-                best_city_score=best_city_score,
-            ):
-                strong_landmark_candidate = self._get_strong_landmark_candidate(
-                    query=active_query,
-                    city_hint=active_city,
-                    local_items=local_items,
-                    best_city=best_city,
-                    best_city_score=best_city_score,
-                    best_city_items=best_city_items,
-                    allow_city_switch=allow_city_switch,
-                )
-
-            if strong_landmark_candidate is not None and strong_landmark_candidate.suggested_city:
-                forced_city = strong_landmark_candidate.suggested_city
-                forced_query = strong_landmark_candidate.query
-                forced_items = (
-                    list(best_city_items)
-                    if self._same_city(best_city, forced_city)
-                    else []
-                )
-
-                debug.ai_refine_triggered = True
-                debug.parallel_switch_reason = "strong_landmark_ai_force_switch"
-                debug.city_switch_suggested = True
-                debug.city_switch_from = active_city
-                debug.city_switch_to = forced_city
-                if debug.trigger_reason:
-                    debug.trigger_reason = f"{debug.trigger_reason};strong_landmark_ai_force_switch"
-                else:
-                    debug.trigger_reason = "strong_landmark_ai_force_switch"
-                debug.corrected_query = forced_query
-                debug.corrected_city_hint = forced_city
-
-                if allow_city_switch and not forced_items:
-                    try:
-                        forced_items = self._amap_service.search(
-                            query=forced_query,
-                            city_hint=forced_city,
-                            limit=limit,
-                        )
-                    except Exception:
-                        forced_items = []
-
-                debug.corrected_items = list(forced_items)
-                debug.corrected_result_count = len(forced_items)
-
-                if allow_city_switch and forced_items:
-                    debug.ai_refine_applied = True
-                    debug.city_switch_applied = True
-                    debug.final_query = forced_query
-                    debug.final_city_hint = forced_city
-                    return POISearchExecution(items=forced_items, debug=debug)
-
-                debug.final_query = active_query
-                debug.final_city_hint = active_city
-                return POISearchExecution(items=final_items, debug=debug)
-        else:
-            base_items = self._amap_service.search(
-                query=active_query,
-                city_hint=active_city,
-                limit=limit,
-            )
-            final_items = base_items
-
-        debug.final_query = active_query
-        debug.final_city_hint = active_city
-
-        if not self._should_retry_with_ai(normalized_query, normalized_city, base_items):
+        if should_return:
             return POISearchExecution(items=final_items, debug=debug)
 
-        retry_trigger = self._build_retry_trigger(normalized_query, normalized_city, base_items)
-        debug.ai_refine_triggered = True
-        if debug.trigger_reason:
-            debug.trigger_reason = f"{debug.trigger_reason};{retry_trigger}"
-        else:
-            debug.trigger_reason = retry_trigger
+        should_retry, retry_trigger = self._should_retry_with_ai(
+            normalized_query,
+            normalized_city,
+            base_items,
+        )
+        if not should_retry or retry_trigger is None:
+            final_items, debug = self._apply_strong_landmark_guard(
+                query=normalized_query,
+                city_hint=normalized_city,
+                base_items=base_items,
+                current_items=final_items,
+                debug=debug,
+                limit=safe_limit,
+                allow_city_switch=allow_city_switch,
+            )
+            return POISearchExecution(items=final_items, debug=debug)
 
-        retry_candidate = self._get_ai_candidate(
+        debug.ai_refine_triggered = True
+        debug.trigger_reason = retry_trigger
+
+        candidate, ai_confidence, candidate_reason = self._get_ai_candidate(
             query=normalized_query,
             city_hint=normalized_city,
             trigger=retry_trigger,
             base_items=base_items,
-            allow_city_switch=allow_city_switch,
         )
-        if retry_candidate is None:
+        debug.ai_confidence = ai_confidence
+
+        if candidate is None:
+            debug.fallback_reason = candidate_reason or "ai_no_candidate"
+            final_items, debug = self._apply_strong_landmark_guard(
+                query=normalized_query,
+                city_hint=normalized_city,
+                base_items=base_items,
+                current_items=final_items,
+                debug=debug,
+                limit=safe_limit,
+                allow_city_switch=allow_city_switch,
+            )
             return POISearchExecution(items=final_items, debug=debug)
 
-        retry_query = retry_candidate.query
-        retry_city = retry_candidate.city
+        retry_query = candidate.query
+        retry_city = candidate.city
+        suggested_city = candidate.suggested_city
 
-        suggested_city = retry_candidate.suggested_city
         if suggested_city and normalized_city and self._city_key(suggested_city) != self._city_key(normalized_city):
             debug.city_switch_suggested = True
             debug.city_switch_from = normalized_city
             debug.city_switch_to = suggested_city
 
-        if retry_query == active_query and retry_city == active_city:
-            if debug.city_switch_suggested:
-                debug.trigger_reason = retry_trigger
-                debug.ai_refine_triggered = True
-                debug.corrected_query = retry_query
-                debug.corrected_city_hint = suggested_city
+        try:
+            retry_items = self._amap_service.search(
+                query=retry_query,
+                city_hint=retry_city,
+                limit=safe_limit,
+            )
+        except AMapProviderError:
+            debug.corrected_query = retry_query
+            debug.corrected_city_hint = suggested_city or retry_city
+            debug.fallback_reason = "ai_retry_provider_failed"
+            final_items, debug = self._apply_strong_landmark_guard(
+                query=normalized_query,
+                city_hint=normalized_city,
+                base_items=base_items,
+                current_items=final_items,
+                debug=debug,
+                limit=safe_limit,
+                allow_city_switch=allow_city_switch,
+            )
             return POISearchExecution(items=final_items, debug=debug)
 
-        retry_items = self._amap_service.search(
-            query=retry_query,
-            city_hint=retry_city,
-            limit=limit,
-        )
         debug.corrected_query = retry_query
         debug.corrected_city_hint = suggested_city or retry_city
+        debug.corrected_items = list(retry_items)
+        debug.corrected_result_count = len(retry_items)
+
         city_switched = bool(
-            normalized_city and retry_city and self._city_key(retry_city) != self._city_key(normalized_city)
+            normalized_city
+            and retry_city
+            and self._city_key(retry_city) != self._city_key(normalized_city)
         )
         if city_switched:
             debug.city_switch_suggested = True
             debug.city_switch_from = normalized_city
             debug.city_switch_to = retry_city
-        debug.corrected_items = list(retry_items)
-        debug.corrected_result_count = len(retry_items)
 
-        if self._prefer_retry(base_items, retry_items, active_query, retry_query):
+        can_apply = allow_city_switch or not city_switched
+        if can_apply and self._prefer_retry(base_items, retry_items, normalized_query, retry_query):
             final_items = retry_items
             debug.ai_refine_applied = True
             debug.final_query = retry_query
             debug.final_city_hint = retry_city
             if city_switched and allow_city_switch:
                 debug.city_switch_applied = True
+        else:
+            debug.fallback_reason = "ai_applied_no_gain"
+
+        final_items, debug = self._apply_strong_landmark_guard(
+            query=normalized_query,
+            city_hint=normalized_city,
+            base_items=base_items,
+            current_items=final_items,
+            debug=debug,
+            limit=safe_limit,
+            allow_city_switch=allow_city_switch,
+        )
 
         return POISearchExecution(items=final_items, debug=debug)
+
+    def _apply_strong_landmark_guard(
+        self,
+        query: str,
+        city_hint: str | None,
+        base_items: list[POIItem],
+        current_items: list[POIItem],
+        debug: POISearchDebug,
+        limit: int,
+        allow_city_switch: bool,
+    ) -> tuple[list[POIItem], POISearchDebug]:
+        """Second defense: AI strong-landmark arbitration for city-switch suggestion."""
+        if not city_hint:
+            return current_items, debug
+        if not settings.poi_ai_strong_landmark_enabled or not self._query_refiner.enabled:
+            return current_items, debug
+        if debug.city_switch_suggested or debug.city_switch_applied:
+            return current_items, debug
+
+        query_key = self._text_key(query)
+        min_len = max(1, int(settings.poi_ai_strong_landmark_min_query_len))
+        max_len = max(min_len, int(settings.poi_ai_strong_landmark_max_query_len))
+        if len(query_key) < min_len or len(query_key) > max_len:
+            return current_items, debug
+
+        decision = self._query_refiner.detect_strong_landmark(
+            query=query,
+            city_hint=city_hint,
+            local_items=base_items,
+        )
+        if decision is None:
+            return current_items, debug
+
+        debug.ai_refine_triggered = True
+
+        debug.ai_confidence = max(float(debug.ai_confidence or 0.0), float(decision.confidence))
+
+        suggest_threshold = max(0.0, min(1.0, settings.poi_ai_strong_landmark_suggest_confidence_threshold))
+        apply_threshold = max(
+            suggest_threshold,
+            max(0.0, min(1.0, settings.poi_ai_strong_landmark_confidence_threshold)),
+        )
+
+        if decision.confidence < suggest_threshold:
+            return current_items, debug
+        if not decision.is_strong_landmark:
+            return current_items, debug
+
+        suggested_city = self._normalize_city(decision.city_hint_override)
+        if not suggested_city:
+            return current_items, debug
+        if self._city_key(suggested_city) == self._city_key(city_hint):
+            return current_items, debug
+
+        refined_query = self._normalize_query(decision.cleaned_query) or query
+
+        debug.city_switch_suggested = True
+        debug.city_switch_from = city_hint
+        debug.city_switch_to = suggested_city
+        debug.corrected_query = refined_query
+        debug.corrected_city_hint = suggested_city
+        if debug.trigger_reason:
+            debug.trigger_reason = f"{debug.trigger_reason};strong_landmark_guard"
+        else:
+            debug.trigger_reason = "strong_landmark_guard"
+
+        if not allow_city_switch:
+            if not debug.fallback_reason:
+                debug.fallback_reason = "strong_landmark_suggested"
+            return current_items, debug
+
+        if decision.confidence < apply_threshold:
+            if not debug.fallback_reason:
+                debug.fallback_reason = "strong_landmark_suggested_not_applied"
+            return current_items, debug
+
+        try:
+            switched_items = self._amap_service.search(
+                query=refined_query,
+                city_hint=suggested_city,
+                limit=limit,
+            )
+        except AMapProviderError:
+            debug.fallback_reason = "strong_landmark_retry_provider_failed"
+            return current_items, debug
+
+        debug.corrected_items = list(switched_items)
+        debug.corrected_result_count = len(switched_items)
+
+        has_target_full_match = self._has_full_query_name_match(refined_query, switched_items)
+        if switched_items and (has_target_full_match or self._prefer_retry(base_items, switched_items, query, refined_query)):
+            debug.ai_refine_applied = True
+            debug.city_switch_applied = True
+            debug.final_query = refined_query
+            debug.final_city_hint = suggested_city
+            return switched_items, debug
+
+        if not debug.fallback_reason:
+            debug.fallback_reason = "strong_landmark_no_gain"
+        return current_items, debug
 
     def _get_ai_candidate(
         self,
@@ -506,9 +519,8 @@ class POISearchService:
         city_hint: str | None,
         trigger: str,
         base_items: list[POIItem],
-        allow_city_switch: bool,
-    ) -> RefineCandidate | None:
-        """Return refined query/city only when confidence and diff checks pass."""
+    ) -> tuple[RefineCandidate | None, float | None, str | None]:
+        """Return refined query/city and confidence if candidate is worth retrying."""
         decision = self._query_refiner.refine(
             query=query,
             city_hint=city_hint,
@@ -517,261 +529,58 @@ class POISearchService:
             top_items=base_items,
         )
         if decision is None:
-            return None
+            return None, None, "ai_unavailable_or_parse_failed"
 
-        if decision.confidence < settings.poi_ai_confidence_threshold:
-            return None
+        confidence = float(decision.confidence)
+        if confidence < settings.poi_ai_confidence_threshold:
+            return None, confidence, "ai_low_confidence"
 
         refined_query = self._normalize_query(decision.cleaned_query)
         if not refined_query:
-            return None
+            return None, confidence, "ai_empty_query"
 
         suggested_city = self._normalize_city(decision.city_hint_override)
         if suggested_city and city_hint and self._city_key(suggested_city) == self._city_key(city_hint):
             suggested_city = None
 
-        if allow_city_switch:
-            refined_city = suggested_city or city_hint
-        else:
-            refined_city = city_hint
+        refined_city = suggested_city or city_hint
 
         if refined_query == query and refined_city == city_hint and suggested_city is None:
-            return None
+            return None, confidence, "ai_no_effect"
 
-        return RefineCandidate(query=refined_query, city=refined_city, suggested_city=suggested_city)
+        return (
+            RefineCandidate(
+                query=refined_query,
+                city=refined_city,
+                suggested_city=suggested_city,
+            ),
+            confidence,
+            None,
+        )
 
-    def _should_retry_with_ai(self, query: str, city_hint: str | None, items: list[POIItem]) -> bool:
+    def _should_retry_with_ai(
+        self,
+        query: str,
+        city_hint: str | None,
+        items: list[POIItem],
+    ) -> tuple[bool, str | None]:
         """Decide whether second-pass AI correction is worth trying."""
         if not settings.poi_ai_refine_enabled or not self._query_refiner.enabled:
-            return False
+            return False, None
 
         if city_hint and not self._has_full_query_name_match(query, items):
-            return True
+            return True, "name_miss_query_substring"
 
         if settings.poi_ai_retry_zero_result and not items:
-            return True
+            return True, "zero_result"
 
         if self._is_alpha_only(query) and len(items) < settings.poi_ai_alpha_result_threshold:
-            return True
+            return True, "alpha_input_low_result"
 
-        if self._is_typo_risk(query):
-            top1_name = items[0].name if items else ""
-            if self._similarity(query, top1_name) < 0.5:
-                return True
+        if len(items) < settings.poi_ai_sparse_result_threshold and not self._has_full_query_name_match(query, items):
+            return True, "sparse_result_no_full_match"
 
-        return False
-
-    def _build_retry_trigger(self, query: str, city_hint: str | None, items: list[POIItem]) -> str:
-        """Build concise trigger reason for the AI refiner."""
-        if city_hint and not self._has_full_query_name_match(query, items):
-            return "name_miss_query_substring"
-        if not items:
-            return "zero_result"
-        if self._is_alpha_only(query):
-            return "alpha_input_low_result"
-        return "typo_risk_low_similarity"
-
-    def _search_parallel_local_global(
-        self,
-        query: str,
-        city_hint: str,
-        limit: int,
-    ) -> tuple[list[POIItem], list[POIItem]]:
-        """Run local-city and nationwide recall in parallel for comparison."""
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            local_future = pool.submit(self._amap_service.search, query, city_hint, limit)
-            global_future = pool.submit(self._amap_service.search, query, None, limit)
-            local_items = local_future.result()
-            try:
-                global_items = global_future.result()
-            except Exception:
-                # Keep local result path available if global recall is rate-limited/unavailable.
-                global_items = []
-
-        return local_items, global_items
-
-    def _select_best_global_city(
-        self,
-        query: str,
-        local_city: str,
-        global_items: list[POIItem],
-    ) -> tuple[str | None, list[POIItem], float]:
-        """Pick the best candidate city from nationwide results by relevance score."""
-        local_key = self._city_key(local_city)
-        grouped: dict[str, list[POIItem]] = defaultdict(list)
-        for item in global_items:
-            city = self._normalize_city(item.city)
-            if city is None:
-                continue
-            grouped[city].append(item)
-
-        best_city: str | None = None
-        best_items: list[POIItem] = []
-        best_score = 0.0
-        for city, items in grouped.items():
-            if self._city_key(city) == local_key:
-                continue
-
-            ranked_items = sorted(
-                items,
-                key=lambda item: self._item_relevance_score(query, item),
-                reverse=True,
-            )
-            score = self._city_relevance_score(query, ranked_items)
-            if score > best_score:
-                best_city = city
-                best_items = ranked_items
-                best_score = score
-
-        return best_city, best_items, best_score
-
-    def _switch_reason_by_relevance(
-        self,
-        query: str,
-        local_city: str,
-        local_items: list[POIItem],
-        local_score: float,
-        candidate_city: str | None,
-        candidate_items: list[POIItem],
-        candidate_score: float,
-    ) -> str | None:
-        """Return switch reason when candidate city is significantly more relevant."""
-        if candidate_city is None or not candidate_items:
-            return None
-        if self._city_key(candidate_city) == self._city_key(local_city):
-            return None
-
-        margin = max(0.0, settings.poi_parallel_city_switch_margin)
-        min_score = max(0.0, settings.poi_parallel_city_switch_min_score)
-        score_delta = candidate_score - local_score
-
-        local_full_match = self._has_full_query_name_match(query, local_items)
-        candidate_full_match = self._has_full_query_name_match(query, candidate_items)
-        local_ordered_match = self._has_ordered_query_name_match(query, local_items)
-        candidate_ordered_match = self._has_ordered_query_name_match(query, candidate_items)
-
-        if candidate_full_match and not local_full_match:
-            return "full_name_match_gain"
-
-        if candidate_ordered_match and not local_ordered_match and score_delta >= margin * 0.25:
-            return "ordered_name_match_gain"
-
-        if candidate_score >= min_score and score_delta >= margin * 1.5:
-            return "high_relevance_gain"
-
-        return None
-
-    def _should_run_strong_landmark_check(
-        self,
-        query: str,
-        local_items: list[POIItem],
-        best_city: str | None,
-        local_score: float,
-        best_city_score: float,
-    ) -> bool:
-        """Decide whether to run AI strong-landmark arbitration."""
-        if not settings.poi_ai_strong_landmark_enabled or not self._query_refiner.enabled:
-            return False
-        if best_city is None or not local_items:
-            return False
-
-        query_key = self._text_key(query)
-        if len(query_key) < 2 or len(query_key) > 12:
-            return False
-
-        # Only arbitrate when local looks relevant enough to cause ambiguity.
-        if not self._has_full_query_name_match(query, local_items):
-            return False
-
-        # Candidate city should be competitive enough to be meaningful.
-        if best_city_score < settings.poi_parallel_city_switch_min_score * 0.8:
-            return False
-        if best_city_score + 0.03 < local_score:
-            return False
-
-        return True
-
-    def _get_strong_landmark_candidate(
-        self,
-        query: str,
-        city_hint: str,
-        local_items: list[POIItem],
-        best_city: str,
-        best_city_score: float,
-        best_city_items: list[POIItem],
-        allow_city_switch: bool,
-    ) -> RefineCandidate | None:
-        """Get AI forced city-switch candidate for strong landmark queries."""
-        decision = self._query_refiner.detect_strong_landmark(
-            query=query,
-            city_hint=city_hint,
-            local_items=local_items,
-            candidate_city=best_city,
-            candidate_score=best_city_score,
-            candidate_items=best_city_items,
-        )
-        if decision is None:
-            return None
-
-        if decision.confidence < settings.poi_ai_strong_landmark_confidence_threshold:
-            return None
-        if not (decision.is_strong_landmark or decision.force_city_switch):
-            return None
-
-        refined_query = self._normalize_query(decision.cleaned_query)
-        if not refined_query:
-            refined_query = query
-
-        suggested_city = self._normalize_city(decision.city_hint_override) or best_city
-        if suggested_city is None:
-            return None
-        if self._city_key(suggested_city) == self._city_key(city_hint):
-            return None
-
-        refined_city = suggested_city if allow_city_switch else city_hint
-        return RefineCandidate(query=refined_query, city=refined_city, suggested_city=suggested_city)
-
-    def _city_relevance_score(self, query: str, items: list[POIItem]) -> float:
-        """Compute city-level relevance score from ranked POI items."""
-        if not items:
-            return 0.0
-
-        top_items = items[:8]
-        weighted_sum = 0.0
-        weight_total = 0.0
-        full_match_count = 0
-        ordered_match_count = 0
-
-        for idx, item in enumerate(top_items):
-            weight = 1.0 / (idx + 1)
-            weighted_sum += self._item_relevance_score(query, item) * weight
-            weight_total += weight
-            if self._query_in_name(query, item.name):
-                full_match_count += 1
-            if self._query_in_order(query, item.name):
-                ordered_match_count += 1
-
-        rank_score = weighted_sum / weight_total if weight_total else 0.0
-        full_match_ratio = full_match_count / len(top_items)
-        ordered_match_ratio = ordered_match_count / len(top_items)
-        recall_score = min(len(items), 8) / 8.0
-        return min(1.0, rank_score * 0.6 + full_match_ratio * 0.2 + ordered_match_ratio * 0.15 + recall_score * 0.05)
-
-    def _item_relevance_score(self, query: str, item: POIItem) -> float:
-        """Compute item-level relevance score for sorting and comparison."""
-        query_key = self._text_key(query)
-        name_key = self._text_key(item.name)
-
-        full_match_bonus = 0.25 if query_key and query_key in name_key else 0.0
-        ordered_match_bonus = 0.18 if self._query_in_order(query, item.name) else 0.0
-        prefix_bonus = 0.10 if query_key and name_key.startswith(query_key) else 0.0
-        name_similarity = self._similarity(query, item.name)
-        address_similarity = self._similarity(query, item.address)
-
-        return min(
-            1.0,
-            name_similarity * 0.45 + address_similarity * 0.08 + full_match_bonus + ordered_match_bonus + prefix_bonus,
-        )
+        return False, None
 
     def _prefer_retry(
         self,
@@ -793,7 +602,7 @@ class POISearchService:
 
         base_score = self._result_score(base_items, base_query)
         retry_score = self._result_score(retry_items, retry_query)
-        return retry_score > base_score + 0.12
+        return retry_score > base_score + settings.poi_ai_result_gain_threshold
 
     def _result_score(self, items: list[POIItem], query: str) -> float:
         """Simple score combining top-1 relevance and recall count."""
@@ -804,7 +613,7 @@ class POISearchService:
         top_text = f"{top1.name} {top1.address}"
         relevance = self._similarity(query, top_text)
         recall = min(len(items), 5) / 5.0
-        return relevance * 0.65 + recall * 0.35
+        return relevance * 0.7 + recall * 0.3
 
     @staticmethod
     def _normalize_query(query: str) -> str:
@@ -812,6 +621,7 @@ class POISearchService:
         text = unicodedata.normalize("NFKC", str(query or ""))
         text = text.strip()
         text = re.sub(r"\s+", "", text)
+        text = text[: settings.poi_ai_query_max_length]
         text = text.strip("()[]{}<>【】（）'\"“”‘’`")
         text = re.sub(r"[!！?？,，。．;；:：]+$", "", text)
         return text
@@ -824,20 +634,69 @@ class POISearchService:
 
         city = unicodedata.normalize("NFKC", str(city_hint)).strip()
         city = re.sub(r"\s+", "", city)
+        city = re.sub(r"(\(直辖\)|（直辖）)", "", city)
         if not city:
             return None
 
-        municipality = re.fullmatch(r"(北京|上海|天津|重庆)(?:市)?城区", city)
-        if municipality:
-            return f"{municipality.group(1)}市"
+        city = re.sub(r"(?:市)?城区$", "", city)
+        if not city:
+            return None
 
-        if city.endswith("城区") and len(city) <= 4:
-            city = city[:-2]
-
-        if city in MUNICIPALITY_BASES:
+        if city in {"北京", "上海", "天津", "重庆"}:
             return f"{city}市"
 
-        return city or None
+        if re.search(r"(市|自治州|地区|盟|特别行政区|自治区|省|县|区|旗)$", city):
+            return city
+
+        return f"{city}市"
+
+    def _apply_city_scope_guard(
+        self,
+        city_hint: str | None,
+        items: list[POIItem],
+        debug: POISearchDebug,
+        allow_city_switch: bool,
+    ) -> tuple[list[POIItem], POISearchDebug, bool]:
+        """Guard against provider cross-city leakage when city hint is provided."""
+        if not city_hint or not items:
+            return items, debug, False
+
+        top_city = self._normalize_city(items[0].city or items[0].province)
+        if not top_city:
+            return items, debug, False
+        if self._city_key(top_city) == self._city_key(city_hint):
+            return items, debug, False
+
+        debug.city_switch_suggested = True
+        debug.city_switch_from = city_hint
+        debug.city_switch_to = top_city
+        if not debug.trigger_reason:
+            debug.trigger_reason = "top_result_city_mismatch"
+
+        if allow_city_switch:
+            return items, debug, False
+
+        local_items = self._filter_items_by_city(items, city_hint)
+        if local_items:
+            if not debug.fallback_reason:
+                debug.fallback_reason = "city_scope_filtered_cross_city_results"
+            return local_items, debug, False
+
+        if not debug.fallback_reason:
+            debug.fallback_reason = "city_scope_no_local_result"
+        return [], debug, True
+
+    def _filter_items_by_city(self, items: list[POIItem], city_hint: str) -> list[POIItem]:
+        """Keep only items that belong to current city key."""
+        target_key = self._city_key(city_hint)
+        local_items: list[POIItem] = []
+        for item in items:
+            item_city = self._normalize_city(item.city or item.province)
+            if not item_city:
+                continue
+            if self._city_key(item_city) == target_key:
+                local_items.append(item)
+        return local_items
 
     @staticmethod
     def _city_key(city: str) -> str:
@@ -845,24 +704,13 @@ class POISearchService:
         norm = unicodedata.normalize("NFKC", city).strip()
         norm = re.sub(r"\s+", "", norm)
         norm = re.sub(r"(?:市)?城区$", "", norm)
-        return re.sub(r"(省|市|自治区|特别行政区)$", "", norm)
-
-    def _same_city(self, left: str | None, right: str | None) -> bool:
-        """Whether two city labels refer to the same canonical city."""
-        if not left or not right:
-            return False
-        return self._city_key(left) == self._city_key(right)
+        return re.sub(r"(省|市|自治区|特别行政区|地区|盟|州)$", "", norm)
 
     @staticmethod
     def _is_alpha_only(query: str) -> bool:
         """Check if query is pure Latin letters (common pinyin input case)."""
         lowered = query.lower()
         return bool(re.fullmatch(r"[a-z]+", lowered))
-
-    @staticmethod
-    def _is_typo_risk(query: str) -> bool:
-        """Detect typo-prone tokens that often degrade first-pass precision."""
-        return any(token in query for token in TYPO_RISK_TOKENS)
 
     @staticmethod
     def _similarity(left: str, right: str) -> float:
@@ -885,32 +733,6 @@ class POISearchService:
         query_key = POISearchService._text_key(query)
         name_key = POISearchService._text_key(name)
         return bool(query_key and query_key in name_key)
-
-    @staticmethod
-    def _query_in_order(query: str, name: str) -> bool:
-        """Whether query chars appear in order within normalized name."""
-        query_key = POISearchService._text_key(query)
-        name_key = POISearchService._text_key(name)
-        if not query_key or not name_key:
-            return False
-
-        i = 0
-        for ch in name_key:
-            if ch == query_key[i]:
-                i += 1
-                if i == len(query_key):
-                    return True
-
-        return False
-
-    @staticmethod
-    def _has_ordered_query_name_match(query: str, items: list[POIItem]) -> bool:
-        """Whether any result name includes ordered query chars."""
-        for item in items:
-            if POISearchService._query_in_order(query, item.name):
-                return True
-
-        return False
 
     @staticmethod
     def _has_full_query_name_match(query: str, items: list[POIItem]) -> bool:

@@ -3,72 +3,78 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.tools import tool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
-from aigis_agent.schemas.amap_tools import (
-    CoordinateConvertResult,
-    DistrictQueryResult,
-    KeywordSearchResult,
-    NearbySearchResult,
-    POIDetailResult,
-    ResolvePlaceResult,
-    ReverseGeocodeResult,
-    RoutePlanResult,
-)
+from aigis_agent.core.config import settings
 from aigis_agent.schemas.routing import Coordinate
-from aigis_agent.services.amap_service import AMapService
 from aigis_agent.services.isochrone_service import IsochroneService
 from aigis_agent.services.osrm_service import OSRMService
 from aigis_agent.services.poi_search_service import POISearchService
 from aigis_agent.services.site_selection_service import SiteSelectionService
 
-_amap_service = AMapService()
 _osrm_service = OSRMService()
 _isochrone_service = IsochroneService()
 _poi_search_service = POISearchService()
 _site_selection_service = SiteSelectionService()
 
 
-def _todo_tool_result(tool_name: str, api_list: list[str], schema: BaseModel) -> dict:
-    """Return placeholder payload for not-yet-implemented tools."""
+@dataclass(frozen=True)
+class ExecutableToolSpec:
+    """Execution spec for tools allowed in direct agent execution path."""
+
+    tool_obj: Any
+    args_model: type[BaseModel]
+    enabled: bool = True
+
+
+class SearchPOIArgs(BaseModel):
+    """Validated arguments for production POI search tool."""
+
+    query: str = Field(default="", max_length=settings.poi_ai_query_max_length)
+    city_hint: str = ""
+    limit: int = Field(default=10, ge=1, le=50)
+    allow_city_switch: bool = False
+
+
+def _not_enabled_tool_result(tool_name: str, message: str) -> dict[str, Any]:
+    """Return standardized payload for tools intentionally disabled in execution path."""
     return {
-        "status": "todo",
+        "status": "not_enabled",
         "tool": tool_name,
-        "api_candidates": api_list,
-        "schema": schema.model_dump(),
-        "message": "Tool scaffold created. Implementation pending.",
+        "message": message,
+        "count": 0,
+        "items": [],
+    }
+
+
+def _tool_validation_error(tool_name: str, exc: ValidationError) -> dict[str, Any]:
+    """Return normalized validation error payload for tool args."""
+    return {
+        "status": "error",
+        "tool": tool_name,
+        "error": f"Invalid args for {tool_name}",
+        "validation_errors": exc.errors(),
+        "count": 0,
+        "items": [],
     }
 
 
 @tool
 def resolve_place(query: str, city_hint: str = "") -> dict:
-    """Resolve place text to canonical candidates (placeholder).
-
-    Suggested AMap APIs: Input Tips, Keyword Search, Geocode, ID Query.
-    """
+    """Resolve place text to canonical candidates (not enabled in execution path)."""
     _ = (query, city_hint)
-    return _todo_tool_result(
-        tool_name="resolve_place",
-        api_list=["input_tips", "keyword_search", "geocode", "id_query"],
-        schema=ResolvePlaceResult(),
-    )
+    return _not_enabled_tool_result("resolve_place", "Tool not enabled yet.")
 
 
 @tool
 def search_keyword_poi(query: str, city_hint: str = "", limit: int = 10) -> dict:
-    """Search POIs by keyword (placeholder).
-
-    Suggested AMap API: Keyword Search.
-    """
+    """Search POIs by keyword (not enabled in execution path)."""
     _ = (query, city_hint, limit)
-    return _todo_tool_result(
-        tool_name="search_keyword_poi",
-        api_list=["keyword_search"],
-        schema=KeywordSearchResult(),
-    )
+    return _not_enabled_tool_result("search_keyword_poi", "Tool not enabled yet.")
 
 
 @tool
@@ -79,44 +85,23 @@ def search_nearby_poi(
     radius_m: int = 2000,
     limit: int = 20,
 ) -> dict:
-    """Search nearby POIs around a center point (placeholder).
-
-    Suggested AMap API: Nearby Search.
-    """
+    """Search nearby POIs around a center point (not enabled in execution path)."""
     _ = (center_lat, center_lon, keywords, radius_m, limit)
-    return _todo_tool_result(
-        tool_name="search_nearby_poi",
-        api_list=["nearby_search"],
-        schema=NearbySearchResult(),
-    )
+    return _not_enabled_tool_result("search_nearby_poi", "Tool not enabled yet.")
 
 
 @tool
 def get_poi_detail(poi_id: str) -> dict:
-    """Fetch POI details by POI ID (placeholder).
-
-    Suggested AMap API: ID Query.
-    """
+    """Fetch POI details by POI ID (not enabled in execution path)."""
     _ = poi_id
-    return _todo_tool_result(
-        tool_name="get_poi_detail",
-        api_list=["id_query"],
-        schema=POIDetailResult(),
-    )
+    return _not_enabled_tool_result("get_poi_detail", "Tool not enabled yet.")
 
 
 @tool
 def reverse_geocode_point(lat: float, lon: float) -> dict:
-    """Convert coordinates to readable address (placeholder).
-
-    Suggested AMap API: Reverse Geocode.
-    """
+    """Convert coordinates to readable address (not enabled in execution path)."""
     _ = (lat, lon)
-    return _todo_tool_result(
-        tool_name="reverse_geocode_point",
-        api_list=["reverse_geocode"],
-        schema=ReverseGeocodeResult(),
-    )
+    return _not_enabled_tool_result("reverse_geocode_point", "Tool not enabled yet.")
 
 
 @tool
@@ -125,30 +110,16 @@ def plan_route(
     destination: str,
     mode: str = "driving",
 ) -> dict:
-    """Plan route between origin and destination (placeholder).
-
-    Suggested AMap API: Route Planning.
-    """
+    """Plan route between origin and destination (not enabled in execution path)."""
     _ = (origin, destination, mode)
-    return _todo_tool_result(
-        tool_name="plan_route",
-        api_list=["route_planning"],
-        schema=RoutePlanResult(),
-    )
+    return _not_enabled_tool_result("plan_route", "Tool not enabled yet.")
 
 
 @tool
 def resolve_admin_area(keywords: str, subdistrict: int = 1) -> dict:
-    """Resolve administrative area hierarchy (placeholder).
-
-    Suggested AMap API: District Query.
-    """
+    """Resolve administrative area hierarchy (not enabled in execution path)."""
     _ = (keywords, subdistrict)
-    return _todo_tool_result(
-        tool_name="resolve_admin_area",
-        api_list=["district_query"],
-        schema=DistrictQueryResult(),
-    )
+    return _not_enabled_tool_result("resolve_admin_area", "Tool not enabled yet.")
 
 
 @tool
@@ -157,43 +128,51 @@ def convert_coordinate(
     from_system: str = "gps",
     to_system: str = "amap",
 ) -> dict:
-    """Convert coordinate system for map interoperability (placeholder).
-
-    Suggested AMap API: Coordinate Convert.
-    """
+    """Convert coordinate system for map interoperability (not enabled in execution path)."""
     _ = (coords_text, from_system, to_system)
-    return _todo_tool_result(
-        tool_name="convert_coordinate",
-        api_list=["coordinate_convert"],
-        schema=CoordinateConvertResult(),
-    )
+    return _not_enabled_tool_result("convert_coordinate", "Tool not enabled yet.")
 
 
 @tool
 def search_poi(
     query: str,
     city_hint: str = "",
-    limit: int = 5,
+    limit: int = 10,
     allow_city_switch: bool = False,
 ) -> dict:
     """Search POI/address by natural language and return normalized item list."""
-    city = city_hint or None
-    safe_limit = max(1, min(limit, 20))
+    try:
+        parsed = SearchPOIArgs.model_validate(
+            {
+                "query": query,
+                "city_hint": city_hint,
+                "limit": limit,
+                "allow_city_switch": allow_city_switch,
+            }
+        )
+    except ValidationError as exc:
+        return _tool_validation_error("search_poi", exc)
+
+    city = parsed.city_hint.strip() or None
+    safe_limit = max(1, min(parsed.limit, 50))
+
     try:
         result = _poi_search_service.search_with_debug(
-            query=query,
+            query=parsed.query,
             city_hint=city,
             limit=safe_limit,
-            allow_city_switch=allow_city_switch,
+            allow_city_switch=parsed.allow_city_switch,
         )
         return {
-            "query": query,
+            "status": "ok",
+            "query": parsed.query,
             "count": len(result.items),
             "items": [item.model_dump() for item in result.items],
             "debug": result.debug.model_dump(),
         }
     except Exception as exc:
         return {
+            "status": "error",
             "error": f"POI search failed: {exc}",
             "count": 0,
             "items": [],
@@ -255,14 +234,7 @@ def build_service_area(
 
 @tool
 def score_sites(candidates_json: str, demand_points_json: str) -> dict:
-    """Score candidate sites from JSON arrays.
-
-    candidates_json example:
-    [{"id":"A","lat":31.23,"lon":121.47},{"id":"B","lat":31.20,"lon":121.50}]
-
-    demand_points_json example:
-    [{"lat":31.24,"lon":121.48},{"lat":31.22,"lon":121.46}]
-    """
+    """Score candidate sites from JSON arrays."""
     try:
         raw_candidates = json.loads(candidates_json)
         raw_demands = json.loads(demand_points_json)
@@ -309,26 +281,39 @@ def get_gis_tools() -> list:
     ]
 
 
-_EXECUTABLE_TOOL_REGISTRY: dict[str, Any] = {
-    "search_poi": search_poi,
+_EXECUTABLE_TOOL_REGISTRY: dict[str, ExecutableToolSpec] = {
+    "search_poi": ExecutableToolSpec(tool_obj=search_poi, args_model=SearchPOIArgs, enabled=True),
 }
 
 
 def get_execution_tool_names() -> list[str]:
-    """Return tool names that are production-ready for direct execution."""
-    return list(_EXECUTABLE_TOOL_REGISTRY.keys())
+    """Return enabled tool names ready for direct execution."""
+    return [
+        tool_name
+        for tool_name, spec in _EXECUTABLE_TOOL_REGISTRY.items()
+        if spec.enabled
+    ]
 
 
 def invoke_execution_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Invoke an executable tool by name with normalized dict output."""
-    tool_obj = _EXECUTABLE_TOOL_REGISTRY.get(tool_name)
-    if tool_obj is None:
+    """Invoke an executable tool by name with validated args and normalized output."""
+    spec = _EXECUTABLE_TOOL_REGISTRY.get(tool_name)
+    if spec is None:
         raise ValueError(f"Tool not executable: {tool_name}")
 
-    result = tool_obj.invoke(args)
+    if not spec.enabled:
+        return _not_enabled_tool_result(tool_name, "Tool is disabled by execution policy.")
+
+    try:
+        validated_args = spec.args_model.model_validate(args or {})
+    except ValidationError as exc:
+        return _tool_validation_error(tool_name, exc)
+
+    result = spec.tool_obj.invoke(validated_args.model_dump())
     if isinstance(result, dict):
         return result
 
     return {
+        "status": "ok",
         "result": result,
     }

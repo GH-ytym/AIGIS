@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from typing import Any, Iterator
 
 from langchain.agents import create_agent
@@ -95,7 +97,7 @@ class AgentService:
 
     def chat(self, message: str, history: list[dict[str, str]] | None = None) -> str:
         """Chat with configured OpenAI-compatible model for map assistant UI."""
-        question = str(message or "").strip()
+        question = self._sanitize_text(message, settings.agent_query_max_length)
         if not question:
             return "请输入你想聊的内容。"
 
@@ -113,7 +115,7 @@ class AgentService:
 
         for item in (history or [])[-8:]:
             role = str(item.get("role") or "").strip().lower()
-            content = str(item.get("content") or "").strip()
+            content = self._sanitize_text(item.get("content"), settings.agent_query_max_length)
             if not content:
                 continue
             if role == "assistant":
@@ -146,26 +148,25 @@ class AgentService:
 
     def analyze_query(self, query: str) -> AgentDecision:
         """Infer GIS intent with LangChain and fallback safely if unavailable."""
+        safe_query = self._sanitize_text(query, settings.agent_query_max_length)
         if self._agent is None:
             return self._fallback_decision(
-                query,
+                safe_query,
                 "未检测到 AIGIS_OPENAI_API_KEY，已使用本地规则路由。",
             )
 
         try:
-            result = self._agent.invoke(
-                {"messages": [{"role": "user", "content": query}]}
-            )
+            result = self._agent.invoke({"messages": [{"role": "user", "content": safe_query}]})
             decision = self._parse_agent_result(result)
             if decision is not None:
                 return decision
             return self._fallback_decision(
-                query,
+                safe_query,
                 "LangChain 未返回可解析结构，已自动降级为规则路由。",
             )
         except Exception as exc:
             return self._fallback_decision(
-                query,
+                safe_query,
                 f"LangChain 调用失败 ({exc.__class__.__name__})，已自动降级为规则路由。",
             )
 
@@ -177,7 +178,10 @@ class AgentService:
         allow_city_switch: bool = False,
     ) -> AgentAssistOutcome:
         """Plan tool steps from NL input and execute first concrete tool."""
-        normalized_query = str(query or "").strip()
+        normalized_query = self._sanitize_text(query, settings.agent_query_max_length)
+        safe_city_hint = self._sanitize_city_hint(city_hint)
+        safe_limit = max(1, min(int(limit), 50))
+
         if not normalized_query:
             return AgentAssistOutcome(
                 message="请输入你想查询的内容。",
@@ -189,8 +193,8 @@ class AgentService:
                         reason="空输入默认走 POI 查询。",
                         args={
                             "query": "",
-                            "city_hint": city_hint or "",
-                            "limit": max(1, min(limit, 50)),
+                            "city_hint": safe_city_hint or "",
+                            "limit": safe_limit,
                             "allow_city_switch": allow_city_switch,
                         },
                     )
@@ -205,15 +209,15 @@ class AgentService:
 
         plan, planner_fallback = self._plan_assist_tasks(
             query=normalized_query,
-            city_hint=city_hint,
-            limit=limit,
+            city_hint=safe_city_hint,
+            limit=safe_limit,
             allow_city_switch=allow_city_switch,
         )
         tasks = self._normalize_tasks(
             plan.tasks,
             query=normalized_query,
-            city_hint=city_hint,
-            limit=limit,
+            city_hint=safe_city_hint,
+            limit=safe_limit,
             allow_city_switch=allow_city_switch,
         )
 
@@ -221,8 +225,8 @@ class AgentService:
             tasks = [
                 self._default_poi_task(
                     query=normalized_query,
-                    city_hint=city_hint,
-                    limit=limit,
+                    city_hint=safe_city_hint,
+                    limit=safe_limit,
                     allow_city_switch=allow_city_switch,
                     step_id=1,
                     reason="未产出有效任务，已降级到默认 POI 工具。",
@@ -238,8 +242,8 @@ class AgentService:
             fallback_used = True
             task_to_run = self._default_poi_task(
                 query=normalized_query,
-                city_hint=city_hint,
-                limit=limit,
+                city_hint=safe_city_hint,
+                limit=safe_limit,
                 allow_city_switch=allow_city_switch,
                 step_id=task_to_run.step_id,
                 reason=f"工具 {selected_tool} 暂未开放执行，自动降级到 search_poi。",
@@ -266,7 +270,8 @@ class AgentService:
         allow_city_switch: bool = False,
     ) -> Iterator[dict[str, Any]]:
         """Stream planner and tool execution events for frontend bubble rendering."""
-        normalized_query = str(query or "").strip()
+        normalized_query = self._sanitize_text(query, settings.agent_query_max_length)
+        safe_city_hint = self._sanitize_city_hint(city_hint)
         safe_limit = max(1, min(limit, 50))
 
         yield {
@@ -285,7 +290,7 @@ class AgentService:
                         reason="空输入默认走 POI 查询。",
                         args={
                             "query": "",
-                            "city_hint": city_hint or "",
+                            "city_hint": safe_city_hint or "",
                             "limit": safe_limit,
                             "allow_city_switch": allow_city_switch,
                         },
@@ -316,14 +321,14 @@ class AgentService:
         }
         plan, planner_fallback = self._plan_assist_tasks(
             query=normalized_query,
-            city_hint=city_hint,
+            city_hint=safe_city_hint,
             limit=safe_limit,
             allow_city_switch=allow_city_switch,
         )
         tasks = self._normalize_tasks(
             plan.tasks,
             query=normalized_query,
-            city_hint=city_hint,
+            city_hint=safe_city_hint,
             limit=safe_limit,
             allow_city_switch=allow_city_switch,
         )
@@ -332,7 +337,7 @@ class AgentService:
             tasks = [
                 self._default_poi_task(
                     query=normalized_query,
-                    city_hint=city_hint,
+                    city_hint=safe_city_hint,
                     limit=safe_limit,
                     allow_city_switch=allow_city_switch,
                     step_id=1,
@@ -360,7 +365,7 @@ class AgentService:
             }
             task_to_run = self._default_poi_task(
                 query=normalized_query,
-                city_hint=city_hint,
+                city_hint=safe_city_hint,
                 limit=safe_limit,
                 allow_city_switch=allow_city_switch,
                 step_id=task_to_run.step_id,
@@ -452,6 +457,54 @@ class AgentService:
 
         return None
 
+    @staticmethod
+    def _parse_json_object(text: str) -> dict[str, Any] | None:
+        """Parse a JSON object from raw LLM text with fenced/inline fallback."""
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+
+        fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", raw, flags=re.IGNORECASE)
+        candidate = fenced.group(1).strip() if fenced else raw
+
+        try:
+            data = json.loads(candidate)
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            pass
+
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end < 0 or end <= start:
+            return None
+
+        try:
+            data = json.loads(candidate[start : end + 1])
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _sanitize_text(text: str | None, max_length: int) -> str:
+        """Normalize and sanitize free-text input to reduce injection/noise risk."""
+        value = unicodedata.normalize("NFKC", str(text or ""))
+        value = re.sub(r"[\x00-\x1f\x7f]+", " ", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value[: max(1, int(max_length))]
+
+    @staticmethod
+    def _sanitize_city_hint(city_hint: str | None) -> str | None:
+        """Sanitize city hint text while keeping user-intended city labels."""
+        if city_hint is None:
+            return None
+
+        value = unicodedata.normalize("NFKC", str(city_hint))
+        value = re.sub(r"[\x00-\x1f\x7f]+", "", value)
+        value = re.sub(r"\s+", "", value).strip()
+        if not value:
+            return None
+        return value[:40]
+
     def _fallback_decision(self, query: str, message: str) -> AgentDecision:
         """Fallback to deterministic keyword-based intent routing."""
         intent, endpoint = self._infer_intent_keyword(query)
@@ -488,10 +541,13 @@ class AgentService:
 
         planner_prompt = (
             "你是 GIS Agent 规划器。"
-            "请把用户输入拆成任务步骤并返回结构化 JSON。"
+            "请把用户输入拆成任务步骤并返回 JSON 对象。"
             "tool_name 可选：search_poi, analyze_route, build_service_area, score_sites。"
             "当前仅 search_poi 是可执行工具，其他会被自动降级。"
             "如果信息不足，优先先用 search_poi 解析地点。"
+            "输出必须是 JSON 对象，禁止 markdown 代码块和解释性文本。"
+            "JSON 结构示例："
+            "{\"tasks\":[{\"step_id\":1,\"tool_name\":\"search_poi\",\"reason\":\"...\",\"args\":{\"query\":\"...\",\"city_hint\":\"\",\"limit\":20,\"allow_city_switch\":false}}],\"summary\":\"...\"}"
         )
         payload = {
             "query": query,
@@ -501,17 +557,22 @@ class AgentService:
         }
 
         try:
-            planner = self._chat_model.with_structured_output(AssistPlan)
-            plan = planner.invoke(
+            message = self._chat_model.invoke(
                 [
                     {"role": "system", "content": planner_prompt},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ]
             )
-            if isinstance(plan, AssistPlan):
-                return plan, False
 
-            validated = AssistPlan.model_validate(plan)
+            text = self._extract_message_text(message)
+            if not text:
+                return fallback_plan, True
+
+            data = self._parse_json_object(text)
+            if data is None:
+                return fallback_plan, True
+
+            validated = AssistPlan.model_validate(data)
             return validated, False
         except Exception:
             return fallback_plan, True
@@ -532,10 +593,13 @@ class AgentService:
             reason = str(task.reason or "").strip()
 
             if tool_name == "search_poi":
-                args["query"] = str(args.get("query") or query)
-                args["city_hint"] = str(args.get("city_hint") or city_hint or "")
-                args["limit"] = max(1, min(int(args.get("limit") or limit), 50))
-                args["allow_city_switch"] = bool(args.get("allow_city_switch", allow_city_switch))
+                args["query"] = self._sanitize_text(args.get("query") or query, settings.agent_query_max_length)
+                args["city_hint"] = self._sanitize_city_hint(args.get("city_hint") or city_hint) or ""
+                parsed_limit = self._safe_int(args.get("limit"), limit)
+                args["limit"] = max(1, min(parsed_limit, 50))
+                args["allow_city_switch"] = self._safe_bool(
+                    args.get("allow_city_switch", allow_city_switch)
+                )
 
             normalized.append(
                 AgentTaskStep(
@@ -547,6 +611,29 @@ class AgentService:
             )
 
         return normalized
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        """Safely coerce mixed planner values to int without raising."""
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _safe_bool(value: Any) -> bool:
+        """Safely coerce mixed planner values to bool for execution args."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return False
 
     @staticmethod
     def _default_poi_task(
@@ -589,6 +676,10 @@ class AgentService:
         if fallback_used:
             prefix = "已执行助手任务（含降级策略）。"
 
+        status = str(tool_result.get("status") or "")
+        if status == "not_enabled":
+            return f"{prefix} 当前工具未开放：{tool_result.get('message') or '请稍后再试。'}"
+
         if tool_result.get("error"):
             return f"{prefix} 执行失败：{tool_result['error']}"
 
@@ -603,6 +694,13 @@ class AgentService:
     @staticmethod
     def _summarize_tool_result(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
         """Summarize tool result for streaming display to avoid oversized payload."""
+        status = str(tool_result.get("status") or "")
+        if status == "not_enabled":
+            return {
+                "status": "not_enabled",
+                "message": str(tool_result.get("message") or "Tool not enabled"),
+            }
+
         if tool_result.get("error"):
             return {
                 "status": "error",

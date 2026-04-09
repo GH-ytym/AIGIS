@@ -1,6 +1,9 @@
 """FastAPI application entry for the AIGIS agent."""
 
-from fastapi import FastAPI
+import time
+import uuid
+
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 
 from aigis_agent.api.router import api_router
@@ -23,6 +26,18 @@ def create_app() -> FastAPI:
 
     # Serve Leaflet-related JS/CSS assets.
     app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="static")
+
+    @app.middleware("http")
+    async def attach_trace_context(request: Request, call_next):
+        """Attach trace headers to every response for easier diagnostics."""
+        trace_id = request.headers.get("x-trace-id") or uuid.uuid4().hex
+        request.state.trace_id = trace_id
+        started = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        response.headers["X-Trace-Id"] = trace_id
+        response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+        return response
 
     @app.on_event("startup")
     async def on_startup() -> None:
