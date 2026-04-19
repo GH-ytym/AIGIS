@@ -1,0 +1,35 @@
+### Python ###
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+### Environment Variables (Security) ###
+# 包含敏感 API Key 和数据库密码，绝对不能提交
+.env
+.env.local
+.env.*.local
+
+### Frontend / Web ###
+# 如果你后续使用 npm/yarn，请取消下面行的注释
+# node_modules/
+# .DS_Store (Mac)
+# Thumbs.db (Windows)
+
+### IDE / Editors ###
+.vscode/
+.idea/
+*.swp
+*.swo
+
+### Logs and Databases ###
+*.log
+*.sqlite
+docs/
