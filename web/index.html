@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>武汉市 GIS 智能助手（最小框架）</title>
+	<link
+		rel="stylesheet"
+		href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+		integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+		crossorigin=""
+	>
+	<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+	<div id="map"></div>
+
+	<aside class="chat-sidebar" aria-label="智能助手侧边栏">
+		<header class="chat-header">
+			<div class="header-title-wrap">
+				<h1>GIS 智能助手</h1>
+				<p>单轮对话模式：你说一句，我回一句</p>
+			</div>
+		</header>
+
+		<section id="chatMessages" class="chat-messages" aria-live="polite">
+			<div class="empty-state">请输入一句自然语言，我会返回本轮回复、思考过程和 MCP 决策。</div>
+		</section>
+
+		<section class="plan-card" aria-label="LLM思考过程">
+			<h2>LLM 思考过程</h2>
+			<ol id="thinkingList" class="ordered-list"></ol>
+		</section>
+
+		<section class="plan-card" aria-label="MCP调用决策">
+			<h2>MCP 调用决定</h2>
+			<ol id="toolDecisionList" class="ordered-list"></ol>
+		</section>
+
+		<div id="metaInfo" class="meta-info" aria-live="polite"></div>
+
+		<div id="statusBar" class="status-bar" aria-live="polite"></div>
+
+		<section class="input-panel" aria-label="输入与发送">
+			<input
+				id="nlInput"
+				type="text"
+				placeholder="例如：我要去离武大最近的地铁站"
+				autocomplete="off"
+			>
+			<button id="sendBtn" type="button" aria-label="发送消息">发送</button>
+		</section>
+	</aside>
+
+	<script
+		src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+		integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+		crossorigin=""
+	></script>
+	<script src="/static/app.js"></script>
+</body>
+</html>
