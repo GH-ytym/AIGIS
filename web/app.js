@@ -105,15 +105,29 @@ function composeAssistantReply(data) {
 
 	const tasks = Array.isArray(data.llm_task_order) ? data.llm_task_order : [];
 	const tools = Array.isArray(data.mcp_tool_order) ? data.mcp_tool_order : [];
+	const searchPreview = String(data.search_result_preview || "").trim();
+	const routePreview = String(data.route_result_preview || "").trim();
 	if (!tasks.length && !tools.length) {
-		return "我已收到你的请求，但这次没有产出有效的规划步骤。";
+		return "我已收到你的请求，但这次没有产出有效的执行步骤。";
+	}
+
+	const previewLines = [];
+	if (searchPreview) {
+		previewLines.push(`搜索结果摘要: ${searchPreview}`);
+	}
+	if (routePreview) {
+		previewLines.push(`路径结果摘要: ${routePreview}`);
 	}
 
 	if (tools.length) {
-		return `我已完成本轮分析。\n先给你结论：我会按 ${tools.join(" -> ")} 的顺序调用能力来完成任务。`;
+		const header = `我已完成本轮执行。\n本轮已调用: ${tools.join(" -> ")}`;
+		if (previewLines.length) {
+			return `${header}\n${previewLines.join("\n")}`;
+		}
+		return header;
 	}
 
-	return "我已完成本轮分析，下面是我的任务拆分。";
+	return "我已完成本轮执行，下面是任务与决策结果。";
 }
 
 function renderSingleTurnResult(userText, data) {

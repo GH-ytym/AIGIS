@@ -17,4 +17,9 @@ class ChatMessageResponse(BaseModel):
 	llm_task_order: list[str] = Field(default_factory=list)
 	mcp_tool_order: list[str] = Field(default_factory=list)
 	available_mcp_tools: list[str] = Field(default_factory=list)
+	search_tool: str | None = None
+	route_tool: str | None = None
+	fixed_route_origin: str | None = None
+	search_result_preview: str | None = None
+	route_result_preview: str | None = None
 	error: str | None = None
